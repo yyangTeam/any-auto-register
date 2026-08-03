@@ -52,7 +52,8 @@ LEGACY_LOCAL_MS_POOL_PROVIDER_NAME = "local_ms_pool"
 ICLOUD_RELAY_DOMAINS = {"icloud.com", "me.com", "mac.com"}
 FLYSMS_PICKUP_HOST = "flysms.xyz"
 FLYSMS_PICKUP_PATH = "/icloud/pickup"
-FLYSMS_LATEST_MESSAGE_URL = "https://flysms.xyz/icloud/api/pickup/messages/latest"
+FLYSMS_MESSAGES_URL = "https://flysms.xyz/icloud/api/pickup/messages"
+FLYSMS_MESSAGE_LIMIT = 10
 FLYSMS_TOKEN_RE = re.compile(r"^tok_[A-Za-z0-9_-]{1,508}$")
 _IGNORABLE_TRAILING_STATUSES = {
     "trial", "plus", "paid", "success", "failed", "registered", "active",
@@ -525,6 +526,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         self.failure_cooldown_seconds = max(int(failure_cooldown_seconds or 0), 0)
         self.proxy = {"http": proxy, "https": proxy} if proxy else None
         self._oauth_mail_strategy: dict[str, str] = {}
+        self._flysms_detail_cache: dict[tuple[str, str, int], dict] = {}
 
     @classmethod
     def from_config(cls, config: dict) -> "LocalMicrosoftMailboxPool":
@@ -1180,14 +1182,16 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         return hashlib.sha256(material.encode("utf-8", errors="ignore")).hexdigest()[:24]
 
     def _flysms_messages(self, entry: LocalMicrosoftMailboxEntry, email: str, token: str) -> list[dict]:
+        headers = {
+            "accept": "application/json",
+            "authorization": f"Bearer {token}",
+            "x-mailbox-email": email,
+            "user-agent": "Mozilla/5.0",
+        }
         response = requests.get(
-            FLYSMS_LATEST_MESSAGE_URL,
-            headers={
-                "accept": "application/json",
-                "authorization": f"Bearer {token}",
-                "x-mailbox-email": email,
-                "user-agent": "Mozilla/5.0",
-            },
+            FLYSMS_MESSAGES_URL,
+            headers=headers,
+            params={"limit": FLYSMS_MESSAGE_LIMIT},
             proxies=self.proxy,
             timeout=25,
         )
@@ -1217,35 +1221,75 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         if response_email and response_email != entry.key:
             raise RuntimeError("FlySMS 返回的邮箱与账号池邮箱不一致")
 
-        message = payload.get("message")
-        if not isinstance(message, dict):
-            return []
-        subject = _safe_text(message.get("subject"))
-        body = " ".join(
-            value
-            for value in (
-                subject,
-                _safe_text(message.get("text")),
-                _safe_text(message.get("html")),
-                _safe_text(message.get("from")),
+        summaries = payload.get("messages")
+        if not isinstance(summaries, list):
+            raise RuntimeError("FlySMS 返回了无法识别的邮件列表")
+
+        messages: list[dict] = []
+        for summary in summaries[:FLYSMS_MESSAGE_LIMIT]:
+            if not isinstance(summary, dict):
+                continue
+            mailbox = _safe_text(summary.get("mailbox")) or "INBOX"
+            try:
+                uid = int(summary.get("uid") or 0)
+            except (TypeError, ValueError):
+                continue
+            if uid <= 0:
+                continue
+
+            cache_key = (entry.key, mailbox, uid)
+            message = self._flysms_detail_cache.get(cache_key)
+            if message is None:
+                detail_response = requests.get(
+                    f"{FLYSMS_MESSAGES_URL}/{uid}",
+                    headers=headers,
+                    params={"mailbox": mailbox},
+                    proxies=self.proxy,
+                    timeout=25,
+                )
+                if detail_response.status_code == 404:
+                    message = dict(summary)
+                elif detail_response.status_code != 200:
+                    raise RuntimeError(
+                        f"FlySMS 邮件详情读取失败: HTTP {detail_response.status_code}"
+                    )
+                else:
+                    try:
+                        detail_payload = detail_response.json()
+                    except Exception as exc:
+                        raise RuntimeError("FlySMS 返回了无法解析的邮件详情") from exc
+                    if not isinstance(detail_payload, dict):
+                        raise RuntimeError("FlySMS 返回了无法识别的邮件详情")
+                    detail_email = _safe_text(detail_payload.get("email")).lower()
+                    if detail_email and detail_email != entry.key:
+                        raise RuntimeError("FlySMS 返回的邮箱与账号池邮箱不一致")
+                    detail_message = detail_payload.get("message")
+                    message = detail_message if isinstance(detail_message, dict) else dict(summary)
+                self._flysms_detail_cache[cache_key] = message
+
+            subject = _safe_text(message.get("subject") or summary.get("subject"))
+            body = " ".join(
+                value
+                for value in (
+                    subject,
+                    _safe_text(message.get("text")),
+                    _safe_text(message.get("html")),
+                    _safe_text(message.get("preview") or summary.get("preview")),
+                    _safe_text(message.get("from") or summary.get("from")),
+                )
+                if value
             )
-            if value
-        )
-        received = self._first_json_text(
-            message,
-            ("mailboxReceivedAt", "date", "ingestedAt", "sentAt"),
-        )
-        return [{
-            "id": self._stable_message_id(
-                "flysms",
-                entry.key,
-                message.get("mailbox"),
-                message.get("uid"),
-            ),
-            "subject": subject,
-            "bodyPreview": body,
-            "receivedDateTime": received,
-        }]
+            received = self._first_json_text(
+                message,
+                ("mailboxReceivedAt", "date", "ingestedAt", "sentAt"),
+            ) or self._first_json_text(summary, ("mailboxReceivedAt", "date", "ingestedAt"))
+            messages.append({
+                "id": self._stable_message_id("flysms", entry.key, mailbox, uid),
+                "subject": subject,
+                "bodyPreview": body,
+                "receivedDateTime": received,
+            })
+        return messages
 
     @staticmethod
     def _tokenized_latest_endpoint(url: str) -> str | None:

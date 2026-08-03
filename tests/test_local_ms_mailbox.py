@@ -6,7 +6,7 @@ import json
 import pytest
 
 from core.local_ms_mailbox import (
-    FLYSMS_LATEST_MESSAGE_URL,
+    FLYSMS_MESSAGES_URL,
     LocalMicrosoftMailboxEntry,
     LocalMicrosoftMailboxPool,
     OUTLOOK_IMAP_SCOPE,
@@ -50,48 +50,100 @@ def test_icloud_relay_preserves_hyphen_runs_inside_url_token():
     assert entries[0].icloud_api_url.endswith("key=tok_test---key")
 
 
-def test_flysms_pickup_uses_api_and_maps_latest_message(monkeypatch):
+def test_flysms_pickup_scans_message_list_when_newer_notice_hides_otp(monkeypatch):
     entry = parse_xinlan_common_rows(
         "relay@icloud.com------"
         "https://flysms.xyz/icloud/pickup#email=relay%40icloud.com&key=tok_test-key"
     )[0]
-    captured = {}
+    captured = []
 
     class Response:
-        status_code = 200
         headers = {"content-type": "application/json"}
 
-        @staticmethod
-        def json():
-            return {
-                "email": "relay@icloud.com",
-                "entitlementStatus": "active",
-                "message": {
-                    "mailbox": "INBOX",
-                    "uid": 42,
-                    "subject": "Your temporary ChatGPT login code",
-                    "from": "ChatGPT <noreply@example.com>",
-                    "date": "2026-08-03T13:57:39.000Z",
-                    "mailboxReceivedAt": "2026-08-03T13:57:40.000Z",
-                    "text": "Your login code is 123456",
-                    "html": "<strong>123456</strong>",
-                },
-            }
+        def __init__(self, payload, status_code=200):
+            self.payload = payload
+            self.status_code = status_code
 
-    def fake_get(url, *, headers, proxies, timeout):
-        captured.update(url=url, headers=headers, proxies=proxies, timeout=timeout)
-        return Response()
+        def json(self):
+            return self.payload
+
+    listing = {
+        "email": "relay@icloud.com",
+        "messages": [
+            {
+                "mailbox": "INBOX",
+                "uid": 43,
+                "subject": "New sign-in to your OpenAI account",
+                "from": "OpenAI <noreply@example.com>",
+                "date": "2026-08-03T13:57:41.000Z",
+                "preview": "No action is needed if this was you.",
+            },
+            {
+                "mailbox": "INBOX",
+                "uid": 42,
+                "subject": "Your temporary ChatGPT login code",
+                "from": "ChatGPT <noreply@example.com>",
+                "date": "2026-08-03T13:57:40.000Z",
+                "preview": "Your temporary login code",
+            },
+        ],
+    }
+    details = {
+        43: {
+            "email": "relay@icloud.com",
+            "message": {
+                "mailbox": "INBOX",
+                "uid": 43,
+                "subject": "New sign-in to your OpenAI account",
+                "date": "2026-08-03T13:57:41.000Z",
+                "text": "No action is needed if this was you.",
+            },
+        },
+        42: {
+            "email": "relay@icloud.com",
+            "entitlementStatus": "active",
+            "message": {
+                "email": "relay@icloud.com",
+                "mailbox": "INBOX",
+                "uid": 42,
+                "subject": "Your temporary ChatGPT login code",
+                "from": "ChatGPT <noreply@example.com>",
+                "date": "2026-08-03T13:57:39.000Z",
+                "mailboxReceivedAt": "2026-08-03T13:57:40.000Z",
+                "text": "Your login code is 123456",
+                "html": "<strong>123456</strong>",
+            },
+        },
+    }
+
+    def fake_get(url, *, headers, params, proxies, timeout):
+        captured.append((url, headers, params, proxies, timeout))
+        if url == FLYSMS_MESSAGES_URL:
+            return Response(listing)
+        uid = int(url.rsplit("/", 1)[-1])
+        return Response(details[uid])
 
     monkeypatch.setattr("core.local_ms_mailbox.requests.get", fake_get)
 
-    messages = LocalMicrosoftMailboxPool()._icloud_api_messages(entry)
+    mailbox = LocalMicrosoftMailboxPool()
+    messages = mailbox._icloud_api_messages(entry)
+    cached_messages = mailbox._icloud_api_messages(entry)
 
-    assert captured["url"] == FLYSMS_LATEST_MESSAGE_URL
-    assert captured["headers"]["authorization"] == "Bearer tok_test-key"
-    assert captured["headers"]["x-mailbox-email"] == "relay@icloud.com"
-    assert messages[0]["subject"] == "Your temporary ChatGPT login code"
-    assert "123456" in messages[0]["bodyPreview"]
-    assert messages[0]["receivedDateTime"] == "2026-08-03T13:57:40.000Z"
+    assert captured[0][0] == FLYSMS_MESSAGES_URL
+    assert captured[0][1]["authorization"] == "Bearer tok_test-key"
+    assert captured[0][1]["x-mailbox-email"] == "relay@icloud.com"
+    assert captured[0][2] == {"limit": 10}
+    assert [call[0] for call in captured] == [
+        FLYSMS_MESSAGES_URL,
+        f"{FLYSMS_MESSAGES_URL}/43",
+        f"{FLYSMS_MESSAGES_URL}/42",
+        FLYSMS_MESSAGES_URL,
+    ]
+    assert captured[1][2] == {"mailbox": "INBOX"}
+    assert messages[0]["subject"] == "New sign-in to your OpenAI account"
+    assert "123456" in messages[1]["bodyPreview"]
+    assert messages[1]["receivedDateTime"] == "2026-08-03T13:57:40.000Z"
+    assert cached_messages == messages
 
 
 def test_flysms_pickup_returns_empty_for_mailbox_without_messages(monkeypatch):
