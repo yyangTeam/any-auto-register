@@ -5,7 +5,8 @@ The importer accepts:
 * Xinlan/BH Mailer "common" account rows. Microsoft accounts with Client Id +
   refresh token are read through Microsoft Graph; rows without OAuth material
   fall back to IMAP only when inbound server fields are present and usable.
-* iCloud relay rows in the form: email@icloud.com----https://.../email@icloud.com
+* iCloud relay rows in the form: email@icloud.com----https://.../email@icloud.com.
+  Three or more consecutive hyphens are accepted as the field delimiter.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from email.utils import parsedate_to_datetime
 from email.header import decode_header
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import requests
 
@@ -43,6 +44,11 @@ LEGACY_STATE_FILE = Path(__file__).resolve().parent.parent / "data" / ".local_ms
 LOCAL_MAIL_POOL_PROVIDER_NAME = "local_mail_pool"
 LEGACY_LOCAL_MS_POOL_PROVIDER_NAME = "local_ms_pool"
 ICLOUD_RELAY_DOMAINS = {"icloud.com", "me.com", "mac.com"}
+HYPHEN_DELIMITER_RE = re.compile(r"-{3,}")
+FLYSMS_PICKUP_HOST = "flysms.xyz"
+FLYSMS_PICKUP_PATH = "/icloud/pickup"
+FLYSMS_LATEST_MESSAGE_URL = "https://flysms.xyz/icloud/api/pickup/messages/latest"
+FLYSMS_TOKEN_RE = re.compile(r"^tok_[A-Za-z0-9_-]{1,508}$")
 
 
 @dataclass(frozen=True)
@@ -130,8 +136,16 @@ def split_xinlan_common_line(line: str) -> list[str]:
     text = str(line or "").strip().strip("\ufeff")
     if not text:
         return []
-    if "----" in text:
-        return [item.strip() for item in text.split("----")]
+    delimiter = HYPHEN_DELIMITER_RE.search(text)
+    if delimiter:
+        first = text[:delimiter.start()].strip()
+        remainder = text[delimiter.end():].strip()
+        # Relay URLs may contain long hyphen runs in their fragment token. Once
+        # the second field is a URL, preserve it verbatim instead of splitting
+        # token contents as additional columns.
+        if "@" in first and _looks_like_http_url(remainder):
+            return [first, remainder]
+        return [first, *[item.strip() for item in HYPHEN_DELIMITER_RE.split(remainder, maxsplit=17)]]
     if "\t" in text:
         return [item.strip() for item in text.split("\t")]
     if "，" in text:
@@ -151,6 +165,37 @@ def _looks_like_http_url(value: str) -> bool:
         return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
     except Exception:
         return False
+
+
+def _parse_flysms_pickup_url(value: str, expected_email: str) -> tuple[str, str] | None:
+    """Return FlySMS pickup credentials, or None for a non-FlySMS URL."""
+    try:
+        parsed = urlparse(str(value or "").strip())
+    except Exception:
+        return None
+
+    is_flysms = (
+        parsed.scheme == "https"
+        and (parsed.hostname or "").lower() == FLYSMS_PICKUP_HOST
+        and parsed.port in (None, 443)
+        and parsed.path.rstrip("/") == FLYSMS_PICKUP_PATH
+    )
+    if not is_flysms:
+        return None
+    if parsed.query or parsed.username or parsed.password:
+        raise RuntimeError("FlySMS 取件链接无效: 不支持查询参数或 URL 内嵌账号")
+
+    params = parse_qs(parsed.fragment, keep_blank_values=True)
+    if set(params) != {"email", "key"} or len(params["email"]) != 1 or len(params["key"]) != 1:
+        raise RuntimeError("FlySMS 取件链接无效: #email 和 key 必须各出现一次")
+
+    email = _safe_text(params["email"][0]).lower()
+    token = _safe_text(params["key"][0])
+    if email != _safe_text(expected_email).lower():
+        raise RuntimeError("FlySMS 取件链接中的邮箱与账号池邮箱不一致")
+    if not FLYSMS_TOKEN_RE.fullmatch(token):
+        raise RuntimeError("FlySMS 取件链接中的 key 格式无效")
+    return email, token
 
 
 def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
@@ -690,9 +735,80 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         material = "\n".join(str(part or "") for part in parts)
         return hashlib.sha256(material.encode("utf-8", errors="ignore")).hexdigest()[:24]
 
+    def _flysms_messages(self, entry: LocalMicrosoftMailboxEntry, email: str, token: str) -> list[dict]:
+        response = requests.get(
+            FLYSMS_LATEST_MESSAGE_URL,
+            headers={
+                "accept": "application/json",
+                "authorization": f"Bearer {token}",
+                "x-mailbox-email": email,
+                "user-agent": "Mozilla/5.0",
+            },
+            proxies=self.proxy,
+            timeout=25,
+        )
+        if response.status_code == 404:
+            return []
+        if response.status_code != 200:
+            errors = {
+                401: "邮箱或 key 无效",
+                403: "邮箱已到期、停用或无权取件",
+                429: "请求过于频繁",
+                503: "邮箱正在同步或服务暂时不可用",
+            }
+            detail = errors.get(response.status_code, "收件请求失败")
+            retry_after = str(response.headers.get("retry-after") or "").strip()
+            if response.status_code == 429 and retry_after:
+                detail += f"，请在 {retry_after} 秒后重试"
+            raise RuntimeError(f"FlySMS {detail}: HTTP {response.status_code}")
+
+        try:
+            payload = response.json()
+        except Exception as exc:
+            raise RuntimeError("FlySMS 返回了无法解析的邮件数据") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("FlySMS 返回了无法识别的邮件数据")
+
+        response_email = _safe_text(payload.get("email")).lower()
+        if response_email and response_email != entry.key:
+            raise RuntimeError("FlySMS 返回的邮箱与账号池邮箱不一致")
+
+        message = payload.get("message")
+        if not isinstance(message, dict):
+            return []
+        subject = _safe_text(message.get("subject"))
+        body = " ".join(
+            value
+            for value in (
+                subject,
+                _safe_text(message.get("text")),
+                _safe_text(message.get("html")),
+                _safe_text(message.get("from")),
+            )
+            if value
+        )
+        received = self._first_json_text(
+            message,
+            ("mailboxReceivedAt", "date", "ingestedAt", "sentAt"),
+        )
+        return [{
+            "id": self._stable_message_id(
+                "flysms",
+                entry.key,
+                message.get("mailbox"),
+                message.get("uid"),
+            ),
+            "subject": subject,
+            "bodyPreview": body,
+            "receivedDateTime": received,
+        }]
+
     def _icloud_api_messages(self, entry: LocalMicrosoftMailboxEntry) -> list[dict]:
         if not entry.icloud_api_ready:
             raise RuntimeError(f"iCloud 邮箱缺少接码地址: {entry.email}")
+        flysms_credentials = _parse_flysms_pickup_url(entry.icloud_api_url, entry.email)
+        if flysms_credentials:
+            return self._flysms_messages(entry, *flysms_credentials)
         response = requests.get(
             entry.icloud_api_url,
             headers={

@@ -3,11 +3,15 @@ from __future__ import annotations
 from types import SimpleNamespace
 import json
 
+import pytest
+
 from core.local_ms_mailbox import (
+    FLYSMS_LATEST_MESSAGE_URL,
     LocalMicrosoftMailboxEntry,
     LocalMicrosoftMailboxPool,
     OUTLOOK_IMAP_SCOPE,
     OUTLOOK_TOKEN_URL,
+    parse_xinlan_common_rows,
 )
 
 
@@ -18,6 +22,113 @@ def _entry() -> LocalMicrosoftMailboxEntry:
         client_id="client-id",
         refresh_token="refresh-token",
     )
+
+
+@pytest.mark.parametrize("delimiter", ["---", "----", "-----", "------"])
+def test_icloud_relay_accepts_three_or_more_hyphens(delimiter):
+    text = (
+        f"relay@icloud.com{delimiter}"
+        "https://flysms.xyz/icloud/pickup#email=relay%40icloud.com&key=tok_test-key"
+    )
+
+    entries = parse_xinlan_common_rows(text)
+
+    assert len(entries) == 1
+    assert entries[0].source == "icloud_api"
+    assert entries[0].icloud_api_ready
+    assert entries[0].icloud_api_url.startswith("https://flysms.xyz/icloud/pickup#")
+
+
+def test_icloud_relay_preserves_hyphen_runs_inside_url_token():
+    entries = parse_xinlan_common_rows(
+        "relay@icloud.com------"
+        "https://flysms.xyz/icloud/pickup#email=relay%40icloud.com&key=tok_test---key"
+    )
+
+    assert len(entries) == 1
+    assert entries[0].icloud_api_url.endswith("key=tok_test---key")
+
+
+def test_flysms_pickup_uses_api_and_maps_latest_message(monkeypatch):
+    entry = parse_xinlan_common_rows(
+        "relay@icloud.com------"
+        "https://flysms.xyz/icloud/pickup#email=relay%40icloud.com&key=tok_test-key"
+    )[0]
+    captured = {}
+
+    class Response:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+
+        @staticmethod
+        def json():
+            return {
+                "email": "relay@icloud.com",
+                "entitlementStatus": "active",
+                "message": {
+                    "mailbox": "INBOX",
+                    "uid": 42,
+                    "subject": "Your temporary ChatGPT login code",
+                    "from": "ChatGPT <noreply@example.com>",
+                    "date": "2026-08-03T13:57:39.000Z",
+                    "mailboxReceivedAt": "2026-08-03T13:57:40.000Z",
+                    "text": "Your login code is 123456",
+                    "html": "<strong>123456</strong>",
+                },
+            }
+
+    def fake_get(url, *, headers, proxies, timeout):
+        captured.update(url=url, headers=headers, proxies=proxies, timeout=timeout)
+        return Response()
+
+    monkeypatch.setattr("core.local_ms_mailbox.requests.get", fake_get)
+
+    messages = LocalMicrosoftMailboxPool()._icloud_api_messages(entry)
+
+    assert captured["url"] == FLYSMS_LATEST_MESSAGE_URL
+    assert captured["headers"]["authorization"] == "Bearer tok_test-key"
+    assert captured["headers"]["x-mailbox-email"] == "relay@icloud.com"
+    assert messages[0]["subject"] == "Your temporary ChatGPT login code"
+    assert "123456" in messages[0]["bodyPreview"]
+    assert messages[0]["receivedDateTime"] == "2026-08-03T13:57:40.000Z"
+
+
+def test_flysms_pickup_returns_empty_for_mailbox_without_messages(monkeypatch):
+    entry = parse_xinlan_common_rows(
+        "relay@icloud.com----"
+        "https://flysms.xyz/icloud/pickup#email=relay%40icloud.com&key=tok_test-key"
+    )[0]
+
+    class Response:
+        status_code = 404
+        headers = {}
+
+    monkeypatch.setattr("core.local_ms_mailbox.requests.get", lambda *args, **kwargs: Response())
+
+    assert LocalMicrosoftMailboxPool()._icloud_api_messages(entry) == []
+
+
+def test_flysms_pickup_rejects_mismatched_email_before_request(monkeypatch):
+    entry = LocalMicrosoftMailboxEntry(
+        email="relay@icloud.com",
+        login_account="relay@icloud.com",
+        receive_provider="icloud_api",
+        icloud_api_url=(
+            "https://flysms.xyz/icloud/pickup#"
+            "email=other%40icloud.com&key=tok_test-key"
+        ),
+    )
+    requested = False
+
+    def fake_get(*args, **kwargs):
+        nonlocal requested
+        requested = True
+
+    monkeypatch.setattr("core.local_ms_mailbox.requests.get", fake_get)
+
+    with pytest.raises(RuntimeError, match="邮箱与账号池邮箱不一致"):
+        LocalMicrosoftMailboxPool()._icloud_api_messages(entry)
+    assert not requested
 
 
 def test_outlook_imap_token_uses_consumers_endpoint_and_imap_scope(monkeypatch):
