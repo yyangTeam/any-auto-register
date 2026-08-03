@@ -5,8 +5,10 @@ import json
 
 import pytest
 
+from core.base_mailbox import MailboxAccount
 from core.local_ms_mailbox import (
     FLYSMS_MESSAGES_URL,
+    FLYSMS_OTP_INGESTION_GRACE_SECONDS,
     LocalMicrosoftMailboxEntry,
     LocalMicrosoftMailboxPool,
     OUTLOOK_IMAP_SCOPE,
@@ -132,6 +134,8 @@ def test_flysms_pickup_scans_message_list_when_newer_notice_hides_otp(monkeypatc
     assert captured[0][0] == FLYSMS_MESSAGES_URL
     assert captured[0][1]["authorization"] == "Bearer tok_test-key"
     assert captured[0][1]["x-mailbox-email"] == "relay@icloud.com"
+    assert captured[0][1]["cache-control"] == "no-cache, no-store"
+    assert captured[0][1]["pragma"] == "no-cache"
     assert captured[0][2] == {"limit": 10}
     assert [call[0] for call in captured] == [
         FLYSMS_MESSAGES_URL,
@@ -144,6 +148,86 @@ def test_flysms_pickup_scans_message_list_when_newer_notice_hides_otp(monkeypatc
     assert "123456" in messages[1]["bodyPreview"]
     assert messages[1]["receivedDateTime"] == "2026-08-03T13:57:40.000Z"
     assert cached_messages == messages
+
+
+def test_flysms_pickup_retries_detail_until_ingestion_finishes(monkeypatch):
+    entry = parse_xinlan_common_rows(
+        "relay@icloud.com------"
+        "https://flysms.xyz/icloud/pickup#email=relay%40icloud.com&key=tok_test-key"
+    )[0]
+    listing = {
+        "email": "relay@icloud.com",
+        "messages": [{
+            "mailbox": "INBOX",
+            "uid": 44,
+            "subject": "Your temporary ChatGPT login code",
+            "date": "2026-08-03T15:04:52.000Z",
+            "preview": "Message is still being ingested",
+        }],
+    }
+    detail_calls = 0
+
+    class Response:
+        headers = {"content-type": "application/json"}
+
+        def __init__(self, payload, status_code=200):
+            self.payload = payload
+            self.status_code = status_code
+
+        def json(self):
+            return self.payload
+
+    def fake_get(url, **kwargs):
+        nonlocal detail_calls
+        if url == FLYSMS_MESSAGES_URL:
+            return Response(listing)
+        detail_calls += 1
+        if detail_calls == 1:
+            return Response({}, status_code=404)
+        return Response({
+            "email": "relay@icloud.com",
+            "message": {
+                "mailbox": "INBOX",
+                "uid": 44,
+                "subject": "Your temporary ChatGPT login code",
+                "mailboxReceivedAt": "2026-08-03T15:04:52.000Z",
+                "text": "Enter this temporary verification code to continue: 108174",
+            },
+        })
+
+    monkeypatch.setattr("core.local_ms_mailbox.requests.get", fake_get)
+    mailbox = LocalMicrosoftMailboxPool()
+
+    pending = mailbox._icloud_api_messages(entry)
+    ingested = mailbox._icloud_api_messages(entry)
+
+    assert pending[0]["_detail_pending"] is True
+    assert "108174" not in pending[0]["bodyPreview"]
+    assert ingested[0]["_detail_pending"] is False
+    assert "108174" in ingested[0]["bodyPreview"]
+    assert detail_calls == 2
+
+
+def test_flysms_wait_for_code_adds_ingestion_grace(monkeypatch):
+    entry = parse_xinlan_common_rows(
+        "relay@icloud.com------"
+        "https://flysms.xyz/icloud/pickup#email=relay%40icloud.com&key=tok_test-key"
+    )[0]
+    mailbox = LocalMicrosoftMailboxPool()
+    account = MailboxAccount(email=entry.email)
+    clock = [0.0]
+
+    monkeypatch.setattr(mailbox, "_entry_for_account", lambda _account: entry)
+    monkeypatch.setattr(mailbox, "_messages", lambda _account: [])
+    monkeypatch.setattr("core.local_ms_mailbox.time.time", lambda: clock[0])
+    monkeypatch.setattr(
+        "core.local_ms_mailbox.time.sleep",
+        lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+    )
+
+    expected_timeout = 120 + FLYSMS_OTP_INGESTION_GRACE_SECONDS
+    with pytest.raises(TimeoutError, match=rf"\({expected_timeout}s\)"):
+        mailbox.wait_for_code(account, timeout=120)
 
 
 def test_flysms_pickup_returns_empty_for_mailbox_without_messages(monkeypatch):

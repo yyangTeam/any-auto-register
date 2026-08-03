@@ -21,6 +21,7 @@ import email as email_lib
 import hashlib
 import imaplib
 import json
+import logging
 import re
 import ssl
 import threading
@@ -54,12 +55,15 @@ FLYSMS_PICKUP_HOST = "flysms.xyz"
 FLYSMS_PICKUP_PATH = "/icloud/pickup"
 FLYSMS_MESSAGES_URL = "https://flysms.xyz/icloud/api/pickup/messages"
 FLYSMS_MESSAGE_LIMIT = 10
+FLYSMS_OTP_INGESTION_GRACE_SECONDS = 60
 FLYSMS_TOKEN_RE = re.compile(r"^tok_[A-Za-z0-9_-]{1,508}$")
 _IGNORABLE_TRAILING_STATUSES = {
     "trial", "plus", "paid", "success", "failed", "registered", "active",
     "free", "expired", "invalid", "subscribed", "done", "ok",
     "已注册", "成功", "失败", "已失败", "plus订单", "注册失败",
 }
+
+logger = logging.getLogger(__name__)
 
 
 class _MailboxCardHTMLParser(HTMLParser):
@@ -1187,6 +1191,8 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             "authorization": f"Bearer {token}",
             "x-mailbox-email": email,
             "user-agent": "Mozilla/5.0",
+            "cache-control": "no-cache, no-store",
+            "pragma": "no-cache",
         }
         response = requests.get(
             FLYSMS_MESSAGES_URL,
@@ -1239,6 +1245,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
 
             cache_key = (entry.key, mailbox, uid)
             message = self._flysms_detail_cache.get(cache_key)
+            detail_pending = False
             if message is None:
                 detail_response = requests.get(
                     f"{FLYSMS_MESSAGES_URL}/{uid}",
@@ -1249,9 +1256,15 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 )
                 if detail_response.status_code == 404:
                     message = dict(summary)
+                    detail_pending = True
                 elif detail_response.status_code != 200:
-                    raise RuntimeError(
-                        f"FlySMS 邮件详情读取失败: HTTP {detail_response.status_code}"
+                    message = dict(summary)
+                    detail_pending = True
+                    logger.warning(
+                        "FlySMS 邮件详情暂不可用: email=%s uid=%s HTTP %s",
+                        entry.email,
+                        uid,
+                        detail_response.status_code,
                     )
                 else:
                     try:
@@ -1264,8 +1277,13 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                     if detail_email and detail_email != entry.key:
                         raise RuntimeError("FlySMS 返回的邮箱与账号池邮箱不一致")
                     detail_message = detail_payload.get("message")
-                    message = detail_message if isinstance(detail_message, dict) else dict(summary)
-                self._flysms_detail_cache[cache_key] = message
+                    if isinstance(detail_message, dict):
+                        message = detail_message
+                    else:
+                        message = dict(summary)
+                        detail_pending = True
+                if not detail_pending:
+                    self._flysms_detail_cache[cache_key] = message
 
             subject = _safe_text(message.get("subject") or summary.get("subject"))
             body = " ".join(
@@ -1288,6 +1306,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 "subject": subject,
                 "bodyPreview": body,
                 "receivedDateTime": received,
+                "_detail_pending": detail_pending,
             })
         return messages
 
@@ -1648,7 +1667,8 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
     def get_current_ids(self, account: MailboxAccount) -> set:
         try:
             return {self._message_id(mail) for mail in self._messages(account) if self._message_id(mail)}
-        except Exception:
+        except Exception as exc:
+            logger.warning("读取邮箱当前邮件 ID 失败: email=%s error=%s", account.email, exc)
             return set()
 
     @staticmethod
@@ -1710,15 +1730,26 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         try:
             entry = self._entry_for_account(account)
             poll_interval = 10 if self._mailroom_public_endpoint(entry.icloud_api_url) else 5
+            is_flysms = bool(_parse_flysms_pickup_url(entry.icloud_api_url, entry.email))
         except Exception:
             poll_interval = 5
+            is_flysms = False
+        effective_timeout = timeout + FLYSMS_OTP_INGESTION_GRACE_SECONDS if is_flysms else timeout
         # Microsoft Graph 的 receivedDateTime 与本机触发时间之间可能有 1-2 秒偏差，
         # 给少量宽限；但仍然拒绝明显早于本次 OTP 发送的旧验证码。
         min_received_ts = (float(otp_sent_at) - 15.0) if otp_sent_at else 0.0
-        while time.time() - start < timeout:
+        last_poll_error = ""
+        last_error_log_at = 0.0
+        while time.time() - start < effective_timeout:
             try:
                 mails = self._messages(account)
-            except Exception:
+            except Exception as exc:
+                error = str(exc)
+                now = time.time()
+                if error != last_poll_error or now - last_error_log_at >= 30:
+                    logger.warning("邮箱验证码轮询失败: email=%s error=%s", account.email, error)
+                    last_poll_error = error
+                    last_error_log_at = now
                 time.sleep(poll_interval)
                 continue
             for mail in mails:
@@ -1740,10 +1771,10 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                     if mid:
                         seen.add(mid)
                     return code
-                if mid:
+                if mid and not mail.get("_detail_pending"):
                     seen.add(mid)
             time.sleep(poll_interval)
-        raise TimeoutError(f"等待验证码超时 ({timeout}s)")
+        raise TimeoutError(f"等待验证码超时 ({effective_timeout}s)")
 
     def wait_for_link(
         self,
