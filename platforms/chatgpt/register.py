@@ -309,6 +309,8 @@ class RegistrationEngine:
         # 状态变量
         self.email: Optional[str] = None
         self.password: Optional[str] = None  # 注册密码
+        self.totp_secret: Optional[str] = None  # 已注册账号的 MFA Base32 密钥
+        self.totp_url: Optional[str] = None  # 已注册账号的 MFA 在线取码地址
         self.email_info: Optional[Dict[str, Any]] = None
         self.oauth_start: Optional[OAuthStart] = None
         self.session: Optional[cffi_requests.Session] = None
@@ -325,6 +327,11 @@ class RegistrationEngine:
         self._otp_page_type: Optional[str] = None
         self._last_codex_error: str = ""
         self._codex_direct_token_info: Optional[Dict[str, Any]] = None
+        self._has_supplied_login_password = False
+        # chatgpt.com NextAuth is occasionally challenged at the network edge
+        # while auth.openai.com remains usable.  Keep this explicit so the
+        # later session lookup can follow the same transport branch.
+        self._uses_direct_openai_oauth = False
 
     @staticmethod
     def _debug_auth_enabled() -> bool:
@@ -365,6 +372,115 @@ class RegistrationEngine:
     def _debug_log(self, message: str, level: str = "info"):
         if self._debug_auth_enabled():
             self._log(message, level)
+
+    def _requires_create_account_callback(self) -> bool:
+        """Only a newly created account must finish the web create callback."""
+        return not self._is_existing_account
+
+    @staticmethod
+    def _parse_json_response(response, operation: str) -> Dict[str, Any]:
+        """Parse an API response without hiding an HTML/WAF response as JSON."""
+        try:
+            payload = response.json()
+        except Exception as exc:
+            content_type = str((getattr(response, "headers", {}) or {}).get("content-type") or "")
+            location = str((getattr(response, "headers", {}) or {}).get("location") or "")
+            body = re.sub(r"\s+", " ", str(getattr(response, "text", "") or "")).strip()[:180]
+            raise RuntimeError(
+                f"{operation} 返回非 JSON: status={getattr(response, 'status_code', '?')} "
+                f"content_type={content_type or '-'} url={getattr(response, 'url', '') or '-'} "
+                f"location={location or '-'} body={body!r}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"{operation} 返回 JSON 类型异常: {type(payload).__name__} "
+                f"status={getattr(response, 'status_code', '?')}"
+            )
+        return payload
+
+    def _start_direct_openai_oauth(self, reason: str) -> bool:
+        """Fallback for a chatgpt.com NextAuth edge challenge.
+
+        The registration APIs already run on auth.openai.com.  Starting the
+        normal PKCE authorization there preserves the existing registration
+        path and its callback, without requiring a JSON NextAuth response.
+        """
+        try:
+            self._log(f"ChatGPT NextAuth 不可用，切换 auth.openai.com 直连授权: {reason}", "warning")
+            oauth_start = generate_oauth_url()
+            response = self.session.get(
+                oauth_start.auth_url,
+                headers={"accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+                timeout=20,
+            )
+            did = self.session.cookies.get("oai-did", "")
+            # A challenged chatgpt.com request can taint the current cookie jar
+            # for the subsequent auth.openai.com navigation.  Some exits also
+            # challenge only specific TLS fingerprints, so retry with clean
+            # sessions in the same order used by the existing TLS fallback.
+            if not (200 <= response.status_code < 400) or not did:
+                self._log("直连 OAuth 首次初始化未通过，切换浏览器指纹重试...", "warning")
+                for profile in ("chrome136", "chrome120", "chrome110", "safari184"):
+                    clean_session = cffi_requests.Session(impersonate=profile)
+                    if self.proxy_url:
+                        clean_session.proxies = {"http": self.proxy_url, "https": self.proxy_url}
+                    response = clean_session.get(
+                        oauth_start.auth_url,
+                        headers={"accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+                        timeout=20,
+                    )
+                    did = clean_session.cookies.get("oai-did", "")
+                    self._debug_log(
+                        f"直连 OAuth 指纹 {profile}: status={response.status_code} did={'yes' if did else 'no'}"
+                    )
+                    if 200 <= response.status_code < 400 and did:
+                        self.session = clean_session
+                        try:
+                            self.http_client.session = clean_session
+                        except Exception:
+                            pass
+                        self._log(f"直连 OAuth 使用浏览器指纹: {profile}")
+                        break
+            if not (200 <= response.status_code < 400) or not did:
+                self._log(
+                    "auth.openai.com 直连授权初始化失败: "
+                    f"status={response.status_code} did={'yes' if did else 'no'} "
+                    f"content_type={response.headers.get('content-type', '')}",
+                    "error",
+                )
+                return False
+            self.oauth_start = oauth_start
+            self._uses_direct_openai_oauth = True
+            self._log(f"直连 OAuth 初始化成功: {getattr(response, 'url', oauth_start.auth_url)[:100]}...")
+            return True
+        except Exception as exc:
+            self._log(f"auth.openai.com 直连授权初始化失败: {exc}", "error")
+            return False
+
+    def _start_codex_oauth_session(self, auth_url: str) -> tuple[_TLSFallbackSession, str, str]:
+        """Start Codex OAuth only after a real auth session and device id exist."""
+        last_detail = "no attempts"
+        for profile in ("chrome136", "chrome110", "safari184", "chrome131", "chrome120"):
+            try:
+                raw_session = cffi_requests.Session(impersonate=profile)
+                if self.proxy_url:
+                    raw_session.proxies = {"http": self.proxy_url, "https": self.proxy_url}
+                response = raw_session.get(auth_url, timeout=20)
+                did = raw_session.cookies.get("oai-did", "")
+                last_detail = f"profile={profile} status={response.status_code} did={'yes' if did else 'no'}"
+                self._debug_log(f"Codex OAuth 初始化: {last_detail}")
+                if 200 <= response.status_code < 400 and did:
+                    session = _TLSFallbackSession(
+                        raw_session,
+                        proxy_url=self.proxy_url,
+                        log_fn=self._log,
+                    )
+                    self._log(f"Codex OAuth 初始化成功: profile={profile} status={response.status_code}")
+                    return session, did, profile
+            except Exception as exc:
+                last_detail = f"profile={profile} error={type(exc).__name__}: {exc}"
+                self._debug_log(f"Codex OAuth 初始化失败: {last_detail}", "warning")
+        raise RuntimeError(f"Codex OAuth 初始化失败，未建立有效登录会话: {last_detail}")
 
     def _generate_password(self, length: int = DEFAULT_PASSWORD_LENGTH) -> str:
         """生成随机密码"""
@@ -463,12 +579,19 @@ class RegistrationEngine:
 
             # 2. 获取 CSRF token
             csrf_resp = self.session.get(f"{CHATGPT_APP}/api/auth/csrf", timeout=15)
-            csrf_data = csrf_resp.json()
+            if csrf_resp.status_code != 200:
+                return self._start_direct_openai_oauth(f"csrf HTTP {csrf_resp.status_code}")
+            try:
+                csrf_data = self._parse_json_response(csrf_resp, "NextAuth CSRF")
+            except RuntimeError as exc:
+                return self._start_direct_openai_oauth(str(exc))
             csrf_token = csrf_data.get("csrfToken", "")
             if not csrf_token:
                 # 从 cookie 中提取
                 csrf_cookie = self.session.cookies.get("__Host-next-auth.csrf-token", "")
                 csrf_token = csrf_cookie.split("%7C")[0] if "%7C" in csrf_cookie else csrf_cookie.split("|")[0]
+            if not csrf_token:
+                return self._start_direct_openai_oauth("CSRF token 为空")
             self._log(f"CSRF token: {csrf_token[:20]}...")
 
             # 3. 调用 signin/openai 获取 authorize URL
@@ -476,6 +599,7 @@ class RegistrationEngine:
             if oai_did:
                 signin_url += f"?prompt=login&ext-oai-did={oai_did}"
 
+            from urllib.parse import urlencode
             signin_resp = self.session.post(
                 signin_url,
                 headers={
@@ -483,20 +607,28 @@ class RegistrationEngine:
                     "origin": CHATGPT_APP,
                     "referer": f"{CHATGPT_APP}/",
                 },
-                data=f"callbackUrl={CHATGPT_APP}%2F&csrfToken={csrf_token}&json=true",
+                data=urlencode({"callbackUrl": f"{CHATGPT_APP}/", "csrfToken": csrf_token, "json": "true"}),
                 timeout=15,
             )
             self._log(f"signin/openai 状态: {signin_resp.status_code}")
 
             if signin_resp.status_code != 200:
-                self._log(f"signin/openai 失败: {signin_resp.text[:200]}", "error")
-                return False
+                return self._start_direct_openai_oauth(f"signin/openai HTTP {signin_resp.status_code}")
 
-            signin_data = signin_resp.json()
+            try:
+                signin_data = self._parse_json_response(signin_resp, "NextAuth signin/openai")
+            except RuntimeError as exc:
+                return self._start_direct_openai_oauth(str(exc))
             auth_url = signin_data.get("url", "")
             if not auth_url:
-                self._log("signin/openai 未返回 authorize URL", "error")
-                return False
+                return self._start_direct_openai_oauth("signin/openai 未返回 authorize URL")
+            from urllib.parse import urlparse
+            parsed_auth_url = urlparse(str(auth_url))
+            auth_host = (parsed_auth_url.hostname or "").lower()
+            if not (auth_host.endswith("openai.com") and "authorize" in parsed_auth_url.path.lower()):
+                return self._start_direct_openai_oauth(
+                    f"signin/openai 返回非 authorize URL: {parsed_auth_url.scheme}://{auth_host}{parsed_auth_url.path}"
+                )
 
             self._log(f"OAuth URL: {auth_url[:80]}...")
 
@@ -669,6 +801,30 @@ class RegistrationEngine:
         except Exception as e:
             self._log(f"提交注册表单失败: {e}", "error")
             return SignupFormResult(success=False, error_message=str(e))
+
+    @staticmethod
+    def _is_invalid_state_signup(result: SignupFormResult) -> bool:
+        message = str(getattr(result, "error_message", "") or "").lower()
+        return "invalid_state" in message or "sign-in session is no longer valid" in message
+
+    def _retry_signup_with_fresh_session(self) -> SignupFormResult:
+        """Retry a single-use/expired signup state with a clean OAuth session."""
+        self._log("注册会话已失效，正在使用全新 OAuth 会话重试一次...", "warning")
+        self.http_client = OpenAIHTTPClient(proxy_url=self.proxy_url)
+        self.session = None
+        self.oauth_start = None
+        self._uses_direct_openai_oauth = False
+        self._is_existing_account = False
+
+        if not self._init_session():
+            return SignupFormResult(success=False, error_message="重新初始化会话失败")
+        if not self._start_oauth():
+            return SignupFormResult(success=False, error_message="重新开始 OAuth 流程失败")
+        did = self._get_device_id()
+        if not did:
+            return SignupFormResult(success=False, error_message="重新获取 Device ID 失败")
+        sen_payload = self._check_sentinel(did)
+        return self._submit_signup_form(did, sen_payload)
 
     def _register_password(self) -> Tuple[bool, Optional[str]]:
         """注册密码"""
@@ -1249,6 +1405,29 @@ class RegistrationEngine:
             self._log(f"Codex add_phone 浏览器处理失败: {exc}", "error")
             return None
 
+    def _complete_codex_add_phone_with_retry(self, login_session, codex_oauth, did: str, login_client=None):
+        """Finish SMS verification and refresh only the OAuth state when necessary."""
+        callback = self._complete_add_phone_in_browser(
+            login_session,
+            codex_oauth,
+            did,
+            login_client,
+        )
+        if callback:
+            return callback, codex_oauth
+
+        if not getattr(self.phone_callback, "completed", False):
+            return None, codex_oauth
+        if getattr(self, "_codex_retry_after_phone", False):
+            return None, codex_oauth
+
+        self._codex_retry_after_phone = True
+        self._log("手机验证已完成，旧 OAuth 会话未返回 callback，立即重跑 Codex Auth...")
+        callback = self._acquire_codex_callback()
+        if self._codex_direct_token_info:
+            return None, getattr(self, "_codex_oauth", codex_oauth)
+        return callback, getattr(self, "_codex_oauth", codex_oauth)
+
     def _cookies_dict_from_session(self, session) -> dict:
         cookies: dict[str, str] = {}
         try:
@@ -1437,8 +1616,9 @@ class RegistrationEngine:
         return otp_page
 
     def _complete_codex_login_password_in_browser(self) -> Optional[Dict[str, Any]]:
-        """Use the real passwordless-login button and finish OAuth in a browser."""
+        """Finish a password challenge via MFA or the passwordless email fallback."""
         try:
+            from core.totp import fetch_totp_code, generate_totp
             from platforms.chatgpt.browser_register import ChatGPTBrowserRegister
 
             def wait_for_browser_otp() -> Optional[str]:
@@ -1448,26 +1628,51 @@ class RegistrationEngine:
                 self._log("Codex login 已确认进入验证码页面，开始读取新邮件")
                 return self._get_verification_code()
 
+            def current_mfa_code() -> Optional[str]:
+                secret = str(getattr(self, "totp_secret", "") or "").strip()
+                totp_url = str(getattr(self, "totp_url", "") or "").strip()
+                if totp_url:
+                    code = fetch_totp_code(totp_url, proxy_url=self.proxy_url)
+                    self._log("Codex login 已从 MFA 地址获取当前验证码")
+                    return code
+                if not secret:
+                    return None
+                code = generate_totp(secret)
+                self._log("Codex login 已生成当前 MFA 验证码")
+                return code
+
+            has_mfa = bool(
+                str(getattr(self, "totp_secret", "") or "").strip()
+                or str(getattr(self, "totp_url", "") or "").strip()
+            )
             browser_flow = ChatGPTBrowserRegister(
                 headless=True,
                 proxy=self.proxy_url,
-                otp_callback=wait_for_browser_otp,
+                otp_callback=None if has_mfa else wait_for_browser_otp,
+                mfa_callback=current_mfa_code if has_mfa else None,
                 phone_callback=self.phone_callback,
                 log_fn=self._log,
             )
-            token_info = browser_flow._retry_oauth_fresh_browser(self.email, self.password)
+            browser_password = self.password
+            if getattr(self, "_is_existing_account", False) and not getattr(self, "_has_supplied_login_password", False):
+                # URL-only mailbox entries receive a generated registration
+                # password from the worker. It is not a valid existing-account
+                # credential, so choose the browser's email-OTP login action.
+                browser_password = ""
+            token_info = browser_flow._retry_oauth_fresh_browser(self.email, browser_password)
             if not isinstance(token_info, dict):
-                self._last_codex_error = "浏览器未完成一次性验证码 OAuth"
+                browser_error = str(getattr(browser_flow, "last_oauth_error", "") or "").strip()
+                self._last_codex_error = browser_error or "浏览器 OAuth 未完成"
                 return None
             access_token = str(token_info.get("access_token") or "").strip()
             refresh_token = str(token_info.get("refresh_token") or token_info.get("rt") or "").strip()
             if not access_token or not refresh_token:
                 self._last_codex_error = "浏览器 OAuth token 缺少 access_token 或 refresh_token(rt)"
                 return None
-            self._log("Codex login 浏览器一次性验证码 OAuth 已完成")
+            self._log("Codex login 浏览器 OAuth 已完成")
             return token_info
         except Exception as exc:
-            self._last_codex_error = f"浏览器一次性验证码 OAuth 失败: {exc}"
+            self._last_codex_error = f"浏览器 OAuth 失败: {exc}"
             self._log(self._last_codex_error, "error")
             return None
 
@@ -1487,15 +1692,7 @@ class RegistrationEngine:
 
             self._log("开始 Codex CLI 登录流程...")
 
-            # 1. 创建新 HTTP client + session
-            login_client = OpenAIHTTPClient(proxy_url=self.proxy_url)
-            login_session = _TLSFallbackSession(
-                login_client.session,
-                proxy_url=self.proxy_url,
-                log_fn=self._log,
-            )
-
-            # 2. 生成 Codex CLI OAuth URL (Hydra)
+            # 1. 生成 Codex CLI OAuth URL (Hydra)
             codex_oauth = generate_oauth_url(
                 redirect_uri=CODEX_REDIRECT_URI,
                 scope=CODEX_SCOPE,
@@ -1503,30 +1700,13 @@ class RegistrationEngine:
             )
             self._codex_oauth = codex_oauth
 
-            # 3. 访问 authorize URL 获取 device_id + session cookies
-            response = None
-            did = ""
-            for bootstrap_attempt in range(3):
-                response = login_session.get(codex_oauth.auth_url, timeout=15)
-                did = str(login_session.cookies.get("oai-did") or "")
-                if did:
-                    break
-                self._log(
-                    f"Codex login 未获取 oai-did，重试 {bootstrap_attempt + 1}/3: "
-                    f"HTTP {response.status_code} url={str(response.url)[:120]}",
-                    "warning",
-                )
-                time.sleep(0.5)
+            # 2. 访问 authorize URL 获取 device_id + session cookies.
+            # A 403 must not be retried with the same fingerprint/session.
+            login_session, did, _ = self._start_codex_oauth_session(codex_oauth.auth_url)
+            login_client = OpenAIHTTPClient(proxy_url=self.proxy_url)
             self._debug_log(f"Codex login device_id: {did}")
-            if not did:
-                self._last_codex_error = (
-                    f"OAuth bootstrap 未获取 oai-did: HTTP {getattr(response, 'status_code', 0)} "
-                    f"url={str(getattr(response, 'url', '') or '')[:160]}"
-                )
-                self._log("Codex login 获取 device_id 失败", "error")
-                return None
 
-            # 4. 获取 Sentinel token
+            # 3. 获取 Sentinel token
             sen_payload = None
             try:
                 ua = login_client.default_headers.get("User-Agent", "")
@@ -1535,7 +1715,7 @@ class RegistrationEngine:
                 sen_req_body = json.dumps({"p": sent_p, "id": did, "flow": "authorize_continue"}, separators=(",", ":"))
 
                 from .constants import SENTINEL_FRAME_URL
-                sen_resp = login_client.post(
+                sen_resp = login_session.post(
                     OPENAI_API_ENDPOINTS["sentinel"],
                     headers={
                         "origin": "https://sentinel.openai.com",
@@ -1902,7 +2082,14 @@ class RegistrationEngine:
             self._log(f"处理 OAuth 回调失败: {e}", "error")
             return None
 
-    def login_existing_via_codex_auth(self, *, email: str = "", password: str = "") -> RegistrationResult:
+    def login_existing_via_codex_auth(
+        self,
+        *,
+        email: str = "",
+        password: str = "",
+        totp_secret: str = "",
+        totp_url: str = "",
+    ) -> RegistrationResult:
         """已注册账号入口：只走 Codex OAuth 登录，不走 create-account 注册链路。"""
         result = RegistrationResult(success=False, logs=self.logs)
         try:
@@ -1920,7 +2107,13 @@ class RegistrationEngine:
             # 1. 获取/绑定邮箱账号。邮箱池在 create_email() 里完成占用和元数据绑定。
             if email:
                 self.email = email
+            # Only supplier-provided credentials are valid for a password
+            # challenge. URL-only mailbox registrations use a generated
+            # password and must keep the email-OTP fallback instead.
+            self._has_supplied_login_password = bool(str(password or "").strip())
             self.password = password or self.password or ""
+            self.totp_secret = totp_secret or getattr(self, "totp_secret", "") or ""
+            self.totp_url = totp_url or getattr(self, "totp_url", "") or ""
             if not self.email_info:
                 self._log("1. 获取邮箱池账号...")
                 if not self._create_email():
@@ -1932,9 +2125,18 @@ class RegistrationEngine:
             result.email = self.email or email
             self._is_existing_account = True
 
-            # 2. 直接走 Codex CLI OAuth。该流程会根据 OpenAI 返回的 page_type 决定是否取邮箱 OTP。
-            self._log("2. 走 Codex Auth 获取 OAuth callback...")
-            callback_url = self._acquire_codex_callback()
+            # MFA 导入账号由凭据格式决定登录方式，不能让协议页状态将其降级为邮箱 OTP。
+            if self.totp_secret or self.totp_url:
+                self._log("2. 已识别密码 + MFA 账号，固定走密码和 MFA 登录...")
+                token_info = self._complete_codex_login_password_in_browser()
+                if token_info:
+                    self._codex_direct_token_info = token_info
+                    callback_url = "browser-token-ready"
+                else:
+                    callback_url = None
+            else:
+                self._log("2. 走 Codex Auth 获取 OAuth callback...")
+                callback_url = self._acquire_codex_callback()
             if not callback_url:
                 if self._last_codex_error:
                     result.error_message = f"Codex Auth 未获取到 callback URL: {self._last_codex_error}"
@@ -2070,6 +2272,8 @@ class RegistrationEngine:
             # 7. 提交注册表单 + 解析响应判断账号状态
             self._log("7. 提交注册表单...")
             signup_result = self._submit_signup_form(did, sen_payload)
+            if not signup_result.success and self._is_invalid_state_signup(signup_result):
+                signup_result = self._retry_signup_with_fresh_session()
             if not signup_result.success:
                 result.error_message = f"提交注册表单失败: {signup_result.error_message}"
                 return result
@@ -2125,44 +2329,57 @@ class RegistrationEngine:
 
             # 13. 跟随 callback URL 到 chatgpt.com 获取 session
             callback_url = self._create_account_continue_url
-            if not callback_url or "code=" not in str(callback_url):
+            has_chatgpt_callback = bool(callback_url and "code=" in str(callback_url))
+            session_token = None
+            account_cookie = ""
+            if not has_chatgpt_callback and self._requires_create_account_callback():
                 result.error_message = "create_account 未返回有效的 callback URL"
                 return result
+            if has_chatgpt_callback:
+                self._log("13. 跟随 callback URL 到 chatgpt.com...")
+                cb_resp = self.session.get(callback_url, timeout=20)
+                self._log(f"callback 状态: {cb_resp.status_code}")
 
-            self._log("13. 跟随 callback URL 到 chatgpt.com...")
-            cb_resp = self.session.get(callback_url, timeout=20)
-            self._log(f"callback 状态: {cb_resp.status_code}")
-
-            # 提取 session cookie
-            session_token = self.session.cookies.get("__Secure-next-auth.session-token")
-            account_cookie = self.session.cookies.get("_account", "")
-            if session_token:
-                self._log(f"获取到 session-token: {session_token[:30]}...")
-            if account_cookie:
-                self._log(f"获取到 _account: {account_cookie}")
+                # 提取 session cookie
+                session_token = self.session.cookies.get("__Secure-next-auth.session-token")
+                account_cookie = self.session.cookies.get("_account", "")
+                if session_token:
+                    self._log(f"获取到 session-token: {session_token[:30]}...")
+                if account_cookie:
+                    self._log(f"获取到 _account: {account_cookie}")
+            else:
+                self._log("13. [已注册账号] 无 create_account callback，直接进入 Codex OAuth")
 
             # 14. 从 chatgpt.com/api/auth/session 获取 access_token
             from .constants import CHATGPT_APP
             self._log("14. 获取 session 信息...")
-            session_resp = self.session.get(
-                f"{CHATGPT_APP}/api/auth/session",
-                headers={"accept": "application/json"},
-                timeout=15,
-            )
-            self._log(f"session API 状态: {session_resp.status_code}")
-            self._log(f"session API 响应: {session_resp.text[:500]}")
+            access_token = ""
+            if self._uses_direct_openai_oauth or not has_chatgpt_callback:
+                # The direct branch never depends on a chatgpt.com session:
+                # the Codex PKCE flow below supplies the required tokens.
+                self._log("跳过 chatgpt.com session 查询，继续获取 Codex token")
+            else:
+                session_resp = self.session.get(
+                    f"{CHATGPT_APP}/api/auth/session",
+                    headers={"accept": "application/json"},
+                    timeout=15,
+                )
+                self._log(f"session API 状态: {session_resp.status_code}")
+                try:
+                    session_data = self._parse_json_response(session_resp, "NextAuth session")
+                except RuntimeError as exc:
+                    result.error_message = str(exc)
+                    self._log(result.error_message, "error")
+                    return result
+                access_token = str(session_data.get("accessToken") or "")
+                self._log(f"session keys: {list(session_data.keys())}")
+                self._log(f"accessToken 长度: {len(access_token)}")
 
-            session_data = session_resp.json()
-            access_token = session_data.get("accessToken", "")
-            user_data = session_data.get("user", {})
-            self._log(f"session keys: {list(session_data.keys())}")
-            self._log(f"accessToken 长度: {len(access_token)}")
+                if not access_token:
+                    result.error_message = "chatgpt.com session 未返回 accessToken"
+                    return result
 
-            if not access_token:
-                result.error_message = "chatgpt.com session 未返回 accessToken"
-                return result
-
-            self._log("NextAuth session 获取成功")
+                self._log("NextAuth session 获取成功")
 
             # 15. Codex CLI OTP 登录获取 refresh_token + id_token
             codex_token_info = None
@@ -2180,27 +2397,26 @@ class RegistrationEngine:
                     client_id=CODEX_CLIENT_ID,
                 )
 
-                # 用全新 session（Hydra 需要干净 session）
-                login_client = OpenAIHTTPClient(proxy_url=self.proxy_url)
-                login_session = _TLSFallbackSession(
-                    login_client.session,
-                    proxy_url=self.proxy_url,
-                    log_fn=self._log,
-                )
-
-                # 访问 Codex OAuth URL，跟随重定向到 /log-in
-                login_session.get(codex_oauth.auth_url, timeout=15)
-                did2 = login_session.cookies.get("oai-did", "")
+                # 用全新且已验证的 session（Hydra 需要干净 session）。
+                # HTTP 403 也必须切换指纹，不能带着空 state 继续提交邮箱。
+                login_session, did2, codex_profile = self._start_codex_oauth_session(codex_oauth.auth_url)
                 self._log(f"Codex login did: {did2[:20]}...")
 
-                # 获取 sentinel（用 login_client）
+                # 获取 sentinel（与 authorize/continue 复用同一登录会话）
                 sen2 = None
                 try:
-                    ua2 = login_client.default_headers.get("User-Agent", "")
+                    profile_major = "".join(ch for ch in codex_profile if ch.isdigit()) or "136"
+                    ua2 = (
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Safari/605.1.15"
+                        if codex_profile.startswith("safari")
+                        else "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        f"(KHTML, like Gecko) Chrome/{profile_major}.0.0.0 Safari/537.36"
+                    )
                     gen2 = _SentinelTokenGenerator(did2, ua2)
                     sp2 = gen2.generate_requirements_token()
                     sr2 = json.dumps({"p": sp2, "id": did2, "flow": "authorize_continue"}, separators=(",", ":"))
-                    sr2_resp = login_client.post(
+                    sr2_resp = login_session.post(
                         OPENAI_API_ENDPOINTS["sentinel"],
                         headers={"origin": "https://sentinel.openai.com", "referer": SENTINEL_FRAME_URL, "content-type": "text/plain;charset=UTF-8"},
                         data=sr2,
@@ -2243,8 +2459,16 @@ class RegistrationEngine:
                 page_type = signup_resp.json().get("page", {}).get("type", "")
                 self._log(f"Codex page_type: {page_type}")
 
+                # 已有账号可能直接要求密码。URL-only 邮箱没有已知密码，
+                # 交给浏览器点击一次性验证码入口完成 OAuth。
+                if page_type == "login_password":
+                    self._log("Codex 遇到密码验证，切换浏览器一次性验证码登录...")
+                    codex_token_info = self._complete_codex_login_password_in_browser()
+                    if not codex_token_info:
+                        raise RuntimeError(self._last_codex_error or "浏览器一次性验证码 OAuth 未完成")
+
                 # 如果返回 email_otp_send 或 email_otp_verification，走 OTP 流程
-                if page_type in ("email_otp_send", "email_otp_verification"):
+                elif page_type in ("email_otp_send", "email_otp_verification"):
                     # 发送 OTP
                     if page_type == "email_otp_send":
                         login_session.get(OPENAI_API_ENDPOINTS["send_otp"], headers={
@@ -2277,43 +2501,47 @@ class RegistrationEngine:
                     otp_page = otp_data.get("page", {}).get("type", "")
                     self._log(f"Codex OTP -> page_type={otp_page}")
 
-                    if otp_page == "add_phone":
-                        self._log("Codex CLI 仍需 add_phone，跳过", "warning")
-                        raise RuntimeError("add_phone required")
-
-                    # OTP 成功后，重新访问 OAuth URL 获取 callback
-                    self._log("Codex: 重新访问 OAuth URL...")
-                    resp = login_session.get(codex_oauth.auth_url, allow_redirects=False, timeout=15)
                     codex_callback = None
-                    current_url = codex_oauth.auth_url
-                    for i in range(15):
-                        if resp.status_code not in (301, 302, 303, 307, 308):
-                            break
-                        location = resp.headers.get("Location", "")
-                        if not location:
-                            break
-                        next_url = urllib.parse.urljoin(current_url, location)
-                        self._log(f"Codex 重定向 {i+1}: {next_url[:80]}...")
-                        if "code=" in next_url and "state=" in next_url:
-                            codex_callback = next_url
-                            break
-                        current_url = next_url
-                        resp = login_session.get(current_url, allow_redirects=False, timeout=15)
+                    callback_oauth = codex_oauth
+                    if otp_page == "add_phone":
+                        self._log("Codex CLI 仍需 add_phone，开始短信验证...")
+                        codex_callback, callback_oauth = self._complete_codex_add_phone_with_retry(
+                            login_session,
+                            codex_oauth,
+                            did2,
+                        )
+                        if self._codex_direct_token_info:
+                            codex_token_info = self._codex_direct_token_info
+                        elif not codex_callback:
+                            raise RuntimeError(self._last_codex_error or "add_phone required")
+                    elif otp_page == "login_password":
+                        self._log("Codex OTP 后仍需密码验证，切换浏览器一次性验证码登录...")
+                        codex_token_info = self._complete_codex_login_password_in_browser()
+                        if not codex_token_info:
+                            raise RuntimeError(self._last_codex_error or "浏览器一次性验证码 OAuth 未完成")
+                    else:
+                        # OTP 后可能进入 consent/workspace。优先续接当前会话，
+                        # 不能重新启动一个新的登录 state。
+                        self._log(f"Codex OTP 后续接 OAuth: page_type={otp_page or '-'}")
+                        codex_callback = self._try_codex_callback_with_session(
+                            login_session,
+                            codex_oauth,
+                        )
 
                     if codex_callback:
                         self._log("Codex CLI callback 获取成功")
                         token_json = submit_callback_url(
                             callback_url=codex_callback,
-                            expected_state=codex_oauth.state,
-                            code_verifier=codex_oauth.code_verifier,
+                            expected_state=callback_oauth.state,
+                            code_verifier=callback_oauth.code_verifier,
                             redirect_uri=CODEX_REDIRECT_URI,
                             client_id=CODEX_CLIENT_ID,
                             proxy_url=self.proxy_url,
                         )
                         codex_token_info = json.loads(token_json)
                         self._log(f"Codex token 成功: keys={list(codex_token_info.keys())}")
-                    else:
-                        self._log(f"Codex callback 未获取 (status={resp.status_code})", "warning")
+                    elif not codex_token_info:
+                        self._log("Codex callback 未获取，当前会话未完成 consent/workspace", "warning")
                 else:
                     self._log(f"Codex 非 OTP 流程 ({page_type})，跳过", "warning")
             except Exception as e:

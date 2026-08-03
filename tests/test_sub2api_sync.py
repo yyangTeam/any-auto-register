@@ -33,31 +33,110 @@ def _account() -> AccountRecord:
 
 
 def test_client_uses_admin_api_key_and_import_endpoint():
-    response = _response(200, {
+    group_response = _response(200, {
+        "code": 0,
+        "message": "success",
+        "data": [{"id": 5, "name": "free", "platform": "openai"}],
+    })
+    import_response = _response(200, {
         "code": 0,
         "message": "success",
         "data": {"account_created": 1, "account_failed": 0},
     })
+    account_response = _response(200, {
+        "code": 0,
+        "message": "success",
+        "data": {"items": [{"id": 17, "name": "user@example.com"}]},
+    })
+    bind_response = _response(200, {
+        "code": 0,
+        "message": "success",
+        "data": {"id": 17, "group_ids": [5]},
+    })
     client = Sub2ApiClient("https://sub.example.com", "admin-key")
+    data = {
+        "type": "sub2api-data",
+        "accounts": [{"name": "user@example.com"}],
+    }
 
-    with patch("application.sub2api_sync.requests.post", return_value=response) as post:
-        ok, message = client.import_data({"type": "sub2api-data", "accounts": []})
+    with (
+        patch("application.sub2api_sync.requests.get", side_effect=[group_response, account_response]) as get,
+        patch("application.sub2api_sync.requests.post", return_value=import_response) as post,
+        patch("application.sub2api_sync.requests.put", return_value=bind_response) as put,
+    ):
+        ok, message = client.import_data(data)
 
     assert ok is True
     assert "新增 1" in message
+    assert "已绑定分组 free" in message
+    assert get.call_args_list[0].args[0] == "https://sub.example.com/api/v1/admin/groups/all"
+    assert get.call_args_list[0].kwargs["params"] == {"platform": "openai"}
     request = post.call_args
     assert request.args[0] == "https://sub.example.com/api/v1/admin/accounts/data"
     assert request.kwargs["headers"]["X-API-Key"] == "admin-key"
     assert request.kwargs["json"]["skip_default_group_bind"] is True
+    assert get.call_args_list[1].kwargs["params"]["search"] == "user@example.com"
+    assert put.call_args.args[0] == "https://sub.example.com/api/v1/admin/accounts/17"
+    assert put.call_args.kwargs["json"] == {"group_ids": [5]}
 
 
 def test_client_reports_api_failure():
     response = _response(401, {"code": "UNAUTHORIZED", "message": "bad key"})
-    with patch("application.sub2api_sync.requests.post", return_value=response):
+    with patch("application.sub2api_sync.requests.get", return_value=response):
         ok, message = Sub2ApiClient("https://sub.example.com/api/v1", "bad").import_data({})
 
     assert ok is False
-    assert message == "bad key"
+    assert message == "查询目标分组失败: bad key"
+
+
+def test_client_stops_before_import_when_free_group_is_missing():
+    response = _response(200, {
+        "code": 0,
+        "message": "success",
+        "data": [{"id": 4, "name": "plus", "platform": "openai"}],
+    })
+    with (
+        patch("application.sub2api_sync.requests.get", return_value=response),
+        patch("application.sub2api_sync.requests.post") as post,
+    ):
+        ok, message = Sub2ApiClient("https://sub.example.com", "admin-key").import_data({})
+
+    assert ok is False
+    assert message == "未找到目标分组 free"
+    post.assert_not_called()
+
+
+def test_client_reports_group_binding_failure_after_import():
+    group_response = _response(200, {
+        "code": 0,
+        "message": "success",
+        "data": [{"id": 5, "name": "free", "platform": "openai"}],
+    })
+    import_response = _response(200, {
+        "code": 0,
+        "message": "success",
+        "data": {"account_created": 1, "account_failed": 0},
+    })
+    account_response = _response(200, {
+        "code": 0,
+        "message": "success",
+        "data": {"items": [{"id": 17, "name": "user@example.com"}]},
+    })
+    bind_response = _response(409, {
+        "code": 409,
+        "message": "group conflict",
+    })
+    data = {"accounts": [{"name": "user@example.com"}]}
+
+    with (
+        patch("application.sub2api_sync.requests.get", side_effect=[group_response, account_response]),
+        patch("application.sub2api_sync.requests.post", return_value=import_response),
+        patch("application.sub2api_sync.requests.put", return_value=bind_response),
+    ):
+        ok, message = Sub2ApiClient("https://sub.example.com", "admin-key").import_data(data)
+
+    assert ok is False
+    assert message == "绑定分组 free 失败: group conflict"
 
 
 def test_push_saved_chatgpt_account_reuses_export_format():
@@ -73,7 +152,7 @@ def test_push_saved_chatgpt_account_reuses_export_format():
     assert data["type"] == "sub2api-data"
     assert data["accounts"][0]["name"] == "user@example.com"
     assert data["accounts"][0]["credentials"]["refresh_token"] == "refresh-token"
-    assert any("开始上传: user@example.com -> https://sub.example.com" in line for line in logs)
+    assert any("开始上传: user@example.com -> https://sub.example.com，目标分组: free" in line for line in logs)
     assert any("✓ user@example.com 同步成功（新增 1）" in line for line in logs)
     assert all("admin-key" not in line for line in logs)
 
@@ -95,7 +174,7 @@ def test_push_reports_upload_failure_without_leaking_key():
     ):
         assert push_saved_account_to_sub2api(7, log_fn=logs.append) is False
 
-    assert any("开始上传: user@example.com -> https://sub.example.com" in line for line in logs)
+    assert any("开始上传: user@example.com -> https://sub.example.com，目标分组: free" in line for line in logs)
     assert any("✗ user@example.com HTTP 503" in line for line in logs)
     assert all("secret-key" not in line for line in logs)
 

@@ -6,7 +6,7 @@ import { apiFetch } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Card } from '@/components/ui/card'
-import { Save, Eye, EyeOff, Mail, Shield, Cpu, Sliders, Plus, X, Orbit, Package2, MessageSquare } from 'lucide-react'
+import { Save, Eye, EyeOff, Mail, Shield, Cpu, Sliders, Plus, X, Orbit, Package2, MessageSquare, Inbox, Upload, RefreshCw, Copy, Trash2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import ProviderCards from '@/components/settings/ProviderCards'
 
@@ -468,6 +468,242 @@ function HeroSmsTools({ item }: { item: ProviderSetting }) {
       </div>
       {message ? <div className="mt-2 text-[var(--text-primary)]">{message}</div> : null}
     </div>
+  )
+}
+
+type ManagedMailboxItem = {
+  email: string
+  source_row: string
+  status: 'new' | 'failed'
+  in_use: boolean
+  attempts: number
+  error: string
+  updated_at: string
+}
+
+type ManagedMailboxPool = {
+  provider_key: string
+  new_count: number
+  failed_count: number
+  available_count: number
+  running_count: number
+  items: ManagedMailboxItem[]
+}
+
+const EMPTY_MAILBOX_POOL: ManagedMailboxPool = {
+  provider_key: '',
+  new_count: 0,
+  failed_count: 0,
+  available_count: 0,
+  running_count: 0,
+  items: [],
+}
+
+async function copyPlainText(value: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value)
+    return
+  }
+  const textarea = document.createElement('textarea')
+  textarea.value = value
+  textarea.style.position = 'fixed'
+  textarea.style.opacity = '0'
+  document.body.appendChild(textarea)
+  textarea.select()
+  document.execCommand('copy')
+  textarea.remove()
+}
+
+export function MailboxRegistrationPool() {
+  const [pool, setPool] = useState<ManagedMailboxPool>(EMPTY_MAILBOX_POOL)
+  const [rows, setRows] = useState('')
+  const [activeStatus, setActiveStatus] = useState<'new' | 'failed'>('new')
+  const [loading, setLoading] = useState(true)
+  const [importing, setImporting] = useState(false)
+  const [deleting, setDeleting] = useState('')
+  const [notice, setNotice] = useState('')
+  const [error, setError] = useState('')
+
+  const load = async () => {
+    setLoading(true)
+    setError('')
+    try {
+      const data = await apiFetch('/sms/mailbox-pool')
+      setPool({ ...EMPTY_MAILBOX_POOL, ...data, items: data.items || [] })
+    } catch (e: any) {
+      setError(e.message || '待注册邮箱池加载失败')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    load()
+  }, [])
+
+  const importRows = async () => {
+    if (!rows.trim()) return
+    setImporting(true)
+    setError('')
+    setNotice('')
+    try {
+      const data = await apiFetch('/sms/mailbox-pool/import', {
+        method: 'POST',
+        body: JSON.stringify({ rows }),
+      })
+      setPool({ ...EMPTY_MAILBOX_POOL, ...data.pool, provider_key: data.provider_key, items: data.pool?.items || [] })
+      setRows('')
+      setNotice(`已入库 ${data.imported} 条，重复 ${data.duplicates} 条，已使用 ${data.skipped_used} 条，无效 ${data.invalid} 条`)
+    } catch (e: any) {
+      setError(e.message || '邮箱入库失败')
+    } finally {
+      setImporting(false)
+    }
+  }
+
+  const deleteRow = async (item: ManagedMailboxItem) => {
+    if (!window.confirm(`从待注册邮箱池删除 ${item.email}？`)) return
+    setDeleting(item.email)
+    setError('')
+    try {
+      const data = await apiFetch(`/sms/mailbox-pool/${encodeURIComponent(item.email)}`, { method: 'DELETE' })
+      setPool({ ...EMPTY_MAILBOX_POOL, ...data.pool, provider_key: data.provider_key, items: data.pool?.items || [] })
+      setNotice(`已删除 ${item.email}`)
+    } catch (e: any) {
+      setError(e.message || '删除失败')
+    } finally {
+      setDeleting('')
+    }
+  }
+
+  const visibleItems = pool.items.filter(item => item.status === activeStatus)
+
+  const copyVisible = async () => {
+    const text = visibleItems.map(item => item.source_row).filter(Boolean).join('\n')
+    if (!text) return
+    try {
+      await copyPlainText(text)
+      setNotice(`已复制 ${visibleItems.length} 条邮箱原始数据`)
+    } catch {
+      setError('复制失败，请刷新后重试')
+    }
+  }
+
+  const formatTime = (value: string) => {
+    if (!value) return '—'
+    const date = new Date(value)
+    return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN', { hour12: false })
+  }
+
+  return (
+    <section className="overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg-card)]">
+      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-[var(--border)] px-5 py-4">
+        <div className="flex items-start gap-3">
+          <div className="flex h-9 w-9 flex-none items-center justify-center rounded-lg border border-[var(--border-soft)] bg-[var(--chip-bg)] text-[var(--accent)]">
+            <Inbox className="h-4 w-4" />
+          </div>
+          <div>
+            <h3 className="text-sm font-semibold text-[var(--text-primary)]">待注册邮箱池</h3>
+            <p className="mt-0.5 text-xs text-[var(--text-muted)]">成功自动移出，失败保留到下一批。</p>
+          </div>
+        </div>
+        <Button size="sm" variant="outline" onClick={load} disabled={loading} title="刷新邮箱池">
+          <RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
+          <span className="ml-2">刷新</span>
+        </Button>
+      </div>
+
+      <div className="grid grid-cols-2 gap-px border-b border-[var(--border)] bg-[var(--border)] md:grid-cols-4">
+        {[
+          ['新入库', pool.new_count],
+          ['失败待重试', pool.failed_count],
+          ['可注册', pool.available_count],
+          ['注册中', pool.running_count],
+        ].map(([label, value]) => (
+          <div key={String(label)} className="bg-[var(--bg-card)] px-4 py-3">
+            <div className="text-[11px] text-[var(--text-muted)]">{label}</div>
+            <div className="mt-0.5 text-lg font-semibold text-[var(--text-primary)]">{value}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="border-b border-[var(--border)] px-5 py-4">
+        <textarea
+          value={rows}
+          onChange={event => setRows(event.target.value)}
+          rows={5}
+          placeholder="每行一条邮箱数据"
+          className="control-surface min-h-[112px] resize-y font-mono text-xs"
+        />
+        <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+          <div className="text-xs text-[var(--text-muted)]">入库后进入“新入库”，原邮箱 Provider 配置保持不变。</div>
+          <Button size="sm" onClick={importRows} disabled={importing || !rows.trim()}>
+            <Upload className="h-3.5 w-3.5" />
+            <span className="ml-2">{importing ? '入库中...' : '导入邮箱'}</span>
+          </Button>
+        </div>
+        {error ? <div className="mt-3 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</div> : null}
+        {notice && !error ? <div className="mt-3 rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200">{notice}</div> : null}
+      </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-3">
+        <div className="flex rounded-lg border border-[var(--border)] bg-[var(--chip-bg)] p-1">
+          {([
+            ['new', `新入库 ${pool.new_count}`],
+            ['failed', `失败待重试 ${pool.failed_count}`],
+          ] as const).map(([status, label]) => (
+            <button
+              key={status}
+              type="button"
+              onClick={() => setActiveStatus(status)}
+              className={cn(
+                'rounded-md px-3 py-1.5 text-xs font-medium transition-colors',
+                activeStatus === status
+                  ? 'bg-[var(--accent)] text-white'
+                  : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]',
+              )}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <Button size="sm" variant="outline" onClick={copyVisible} disabled={visibleItems.length === 0} title="复制当前分类原始数据">
+          <Copy className="h-3.5 w-3.5" />
+          <span className="ml-2">复制当前分类</span>
+        </Button>
+      </div>
+
+      <div className="border-t border-[var(--border)]">
+        {loading ? (
+          <div className="px-5 py-8 text-center text-sm text-[var(--text-muted)]">正在加载邮箱池...</div>
+        ) : visibleItems.length === 0 ? (
+          <div className="px-5 py-8 text-center text-sm text-[var(--text-muted)]">
+            {activeStatus === 'new' ? '暂无新入库邮箱' : '暂无失败待重试邮箱'}
+          </div>
+        ) : visibleItems.map(item => (
+          <div key={item.email} className="flex items-start gap-3 border-b border-[var(--border-soft)] px-5 py-3 last:border-b-0">
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="break-all text-sm font-medium text-[var(--text-primary)]">{item.email}</span>
+                {item.in_use ? <Badge variant="default">注册中</Badge> : null}
+                {item.status === 'failed' ? <Badge variant="danger">失败 {item.attempts} 次</Badge> : <Badge variant="secondary">未运行</Badge>}
+              </div>
+              <div className="mt-1 text-xs text-[var(--text-muted)]">{formatTime(item.updated_at)}</div>
+              {item.error ? <div className="mt-1 break-words text-xs text-red-300">{item.error}</div> : null}
+            </div>
+            <button
+              type="button"
+              onClick={() => deleteRow(item)}
+              disabled={item.in_use || deleting === item.email}
+              className="table-action-btn flex h-8 w-8 flex-none items-center justify-center disabled:cursor-not-allowed disabled:opacity-40"
+              title={item.in_use ? '注册中，暂不能删除' : '删除邮箱'}
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        ))}
+      </div>
+    </section>
   )
 }
 

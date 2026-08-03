@@ -6,7 +6,8 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from application.account_exports import AccountExportsService
-from domain.accounts import AccountCreateCommand, AccountExportSelection
+from application.accounts import AccountsService
+from domain.accounts import AccountCreateCommand, AccountExportSelection, AccountRecord
 from infrastructure.accounts_repository import AccountsRepository
 
 
@@ -73,6 +74,47 @@ def test_delete_account(client):
     # Verify it's gone
     get_resp = client.get(f"/api/accounts/{account_id}")
     assert get_resp.status_code == 404
+
+
+def test_delete_account_releases_local_mailbox_reservation(monkeypatch):
+    released: list[str] = []
+
+    class Repository:
+        account = AccountRecord(
+            id=42,
+            platform="chatgpt",
+            email="source+registration@icloud.com",
+            password="secret",
+            provider_resources=[{
+                "provider_type": "mailbox",
+                "provider_name": "local_mail_pool",
+                "resource_type": "mailbox",
+                "resource_identifier": "source@icloud.com",
+                "handle": "source@icloud.com",
+            }],
+        )
+
+        def get(self, account_id):
+            return self.account if account_id == self.account.id else None
+
+        def delete(self, account_id):
+            return account_id == self.account.id
+
+    def release_email(_mailbox, email):
+        released.append(email)
+        return email == "source@icloud.com"
+
+    monkeypatch.setattr(
+        "application.accounts.LocalMicrosoftMailboxPool.release_email",
+        release_email,
+    )
+    result = AccountsService(repository=Repository()).delete_account(42)
+
+    assert result == {
+        "ok": True,
+        "released_mailboxes": ["source@icloud.com"],
+    }
+    assert released == ["source@icloud.com", "source+registration@icloud.com"]
 
 
 def test_update_account(client):

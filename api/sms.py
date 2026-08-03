@@ -16,6 +16,71 @@ class HeroSmsQueryRequest(BaseModel):
     proxy: str = ""
 
 
+class MailboxPoolImportRequest(BaseModel):
+    rows: str = ""
+
+
+def _managed_mailbox_pool():
+    from core.local_ms_mailbox import LocalMicrosoftMailboxPool
+    from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
+
+    settings_repo = ProviderSettingsRepository()
+    definitions_repo = ProviderDefinitionsRepository()
+    candidates = settings_repo.list_enabled("mailbox")
+    for item in candidates:
+        definition = definitions_repo.get_by_key("mailbox", str(item.provider_key or ""))
+        if definition and definition.driver_type in {"local_ms_pool", "local_mail_pool"}:
+            config = settings_repo.resolve_runtime_settings("mailbox", item.provider_key, {})
+            return str(item.provider_key), LocalMicrosoftMailboxPool.from_config(config)
+    raise RuntimeError("未启用本地邮箱池 Provider，请先在邮箱服务中启用")
+
+
+@router.get("/mailbox-pool")
+def mailbox_registration_pool():
+    try:
+        provider_key, pool = _managed_mailbox_pool()
+        return {"provider_key": provider_key, **pool.registration_pool_snapshot()}
+    except Exception as exc:
+        raise HTTPException(409, str(exc))
+
+
+@router.post("/mailbox-pool/import")
+def import_mailbox_registration_pool(body: MailboxPoolImportRequest):
+    if not str(body.rows or "").strip():
+        raise HTTPException(400, "请粘贴至少一行邮箱数据")
+    try:
+        provider_key, pool = _managed_mailbox_pool()
+        result = pool.import_registration_rows(body.rows)
+        return {
+            "provider_key": provider_key,
+            **result,
+            "pool": pool.registration_pool_snapshot(),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, str(exc))
+
+
+@router.delete("/mailbox-pool/{email}")
+def delete_mailbox_registration_row(email: str):
+    try:
+        provider_key, pool = _managed_mailbox_pool()
+        if not pool.delete_registration_row(email):
+            raise HTTPException(404, "邮箱不在待注册池中")
+        return {
+            "ok": True,
+            "provider_key": provider_key,
+            "pool": pool.registration_pool_snapshot(),
+        }
+    except HTTPException:
+        raise
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
+    except Exception as exc:
+        raise HTTPException(400, str(exc))
+
+
 def _saved_herosms_config() -> dict:
     repo = ProviderSettingsRepository()
     # 兼容旧版 provider_key "herosms" 和新版 "herosms_api"

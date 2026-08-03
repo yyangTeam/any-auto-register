@@ -21,7 +21,7 @@ class TaskWorkerState:
 
 
 class TaskRuntime:
-    def __init__(self, *, max_parallel_tasks: int = 16, max_parallel_per_platform: int = 16, poll_interval: float = 0.5):
+    def __init__(self, *, max_parallel_tasks: int = 2, max_parallel_per_platform: int = 2, poll_interval: float = 0.5):
         self.max_parallel_tasks = max_parallel_tasks
         self.max_parallel_per_platform = max_parallel_per_platform
         self.poll_interval = poll_interval
@@ -121,6 +121,6 @@ def _positive_int_env(name: str, default: int) -> int:
 
 
 task_runtime = TaskRuntime(
-    max_parallel_tasks=_positive_int_env("ACCOUNT_MANAGER_MAX_PARALLEL_TASKS", 16),
-    max_parallel_per_platform=_positive_int_env("ACCOUNT_MANAGER_MAX_PARALLEL_PER_PLATFORM", 16),
+    max_parallel_tasks=_positive_int_env("ACCOUNT_MANAGER_MAX_PARALLEL_TASKS", 2),
+    max_parallel_per_platform=_positive_int_env("ACCOUNT_MANAGER_MAX_PARALLEL_PER_PLATFORM", 2),
 )

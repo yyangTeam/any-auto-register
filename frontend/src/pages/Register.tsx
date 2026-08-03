@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { getConfig, getConfigOptions, getPlatforms, invalidateConfigCache } from '@/lib/app-data'
-import type { ConfigOptionsResponse, ProviderOption, ProviderSetting } from '@/lib/config-options'
+import { getConfig, getConfigOptions, getPlatforms, invalidateConfigCache, invalidateConfigOptionsCache } from '@/lib/app-data'
+import type { ConfigOptionsResponse, ProviderField, ProviderOption, ProviderSetting } from '@/lib/config-options'
 import { getCaptchaStrategyLabel, getProviderSelectOptions, listProviderFieldKeys } from '@/lib/config-options'
 import { apiFetch } from '@/lib/utils'
 import { buildExecutorOptions, buildRegistrationOptions, hasReusableOAuthBrowser, pickOAuthExecutor } from '@/lib/registration'
@@ -73,6 +73,10 @@ export default function Register() {
   const [polling, setPolling] = useState(false)
   const [sub2apiSaveState, setSub2apiSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
   const [sub2apiSaveError, setSub2apiSaveError] = useState('')
+  const [mailboxSaveState, setMailboxSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+  const [mailboxSaveError, setMailboxSaveError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [submitError, setSubmitError] = useState('')
   const handledTerminalTaskIdsRef = useRef<Set<string>>(new Set())
   const openedCashierTaskIdsRef = useRef<Set<string>>(new Set())
 
@@ -256,6 +260,58 @@ export default function Register() {
     }
   }, [executorOptions, supportedExecutors, form.executor_type, form.identity_provider, form.chrome_user_data_dir, form.chrome_cdp_url])
 
+  const saveMailboxProviderConfig = async () => {
+    if (form.identity_provider !== 'mailbox' || !currentMailboxProvider) return true
+    const fields = currentMailboxProvider.fields || []
+    if (fields.length === 0) return true
+    setMailboxSaveState('saving')
+    setMailboxSaveError('')
+    try {
+      const config = { ...(currentMailboxSetting?.config || {}) }
+      const auth = { ...(currentMailboxSetting?.auth || {}) }
+      fields.forEach(field => {
+        const nextValue = String(form[field.key] ?? '')
+        if (field.category === 'auth') auth[field.key] = nextValue
+        else config[field.key] = nextValue
+      })
+      const result = await apiFetch('/provider-settings', {
+        method: currentMailboxSetting ? 'PUT' : 'POST',
+        body: JSON.stringify({
+          id: currentMailboxSetting?.id,
+          provider_type: 'mailbox',
+          provider_key: currentMailboxProvider.value,
+          display_name: currentMailboxSetting?.display_name || currentMailboxProvider.label,
+          auth_mode: currentMailboxSetting?.auth_mode || currentMailboxProvider.default_auth_mode || '',
+          enabled: currentMailboxSetting?.enabled ?? true,
+          is_default: currentMailboxSetting?.is_default ?? false,
+          config,
+          auth,
+          metadata: currentMailboxSetting?.metadata || {},
+        }),
+      })
+      const savedItem = result?.item as ProviderSetting | undefined
+      if (savedItem) {
+        setConfigOptions(current => {
+          const settings = current.mailbox_settings || []
+          const exists = settings.some(item => item.id === savedItem.id)
+          return {
+            ...current,
+            mailbox_settings: exists
+              ? settings.map(item => item.id === savedItem.id ? savedItem : item)
+              : [...settings, savedItem],
+          }
+        })
+      }
+      invalidateConfigOptionsCache()
+      setMailboxSaveState('saved')
+      return true
+    } catch (error) {
+      setMailboxSaveState('error')
+      setMailboxSaveError(error instanceof Error ? error.message : String(error))
+      return false
+    }
+  }
+
   const saveSub2ApiConfig = async () => {
     setSub2apiSaveState('saving')
     setSub2apiSaveError('')
@@ -281,43 +337,58 @@ export default function Register() {
   }
 
   const submit = async () => {
-    if (!(await saveSub2ApiConfig())) return
-    const shouldRunAllMailboxes = form.identity_provider === 'mailbox' && Boolean(form.run_all_mailboxes)
-    const extra: Record<string, any> = {
-      identity_provider: form.identity_provider,
-      oauth_provider: form.oauth_provider,
-      oauth_email_hint: form.oauth_email_hint,
-      chrome_user_data_dir: form.chrome_user_data_dir || undefined,
-      chrome_cdp_url: form.chrome_cdp_url || undefined,
-    }
-    if (form.mail_provider) {
-      extra.mail_provider = form.mail_provider
-    }
-    if (form.sms_provider) {
-      extra.sms_provider = form.sms_provider
-    }
-    allProviderFieldKeys.forEach(fieldKey => {
-      if (form[fieldKey] !== undefined) {
-        extra[fieldKey] = form[fieldKey]
+    setSubmitError('')
+    setSubmitting(true)
+    try {
+      if (!(await saveMailboxProviderConfig())) {
+        setSubmitError('邮箱配置保存失败，请查看邮箱配置区域的错误信息。')
+        return
       }
-    })
-    const res = await apiFetch('/tasks/register', {
-      method: 'POST',
-      body: JSON.stringify({
-        platform: form.platform,
-        email: form.email || null,
-        password: form.password || null,
-        count: shouldRunAllMailboxes ? 1 : form.count,
-        concurrency: shouldRunAllMailboxes ? 5 : form.concurrency,
-        run_all_mailboxes: shouldRunAllMailboxes,
-        proxy: form.proxy || null,
-        executor_type: form.executor_type,
-        captcha_solver: 'auto',
-        extra,
-      }),
-    })
-    setTask(res)
-    setPolling(true)
+      if (!(await saveSub2ApiConfig())) {
+        setSubmitError('Sub 配置保存失败，请查看 Sub 配置区域的错误信息。')
+        return
+      }
+      const shouldRunAllMailboxes = form.identity_provider === 'mailbox' && Boolean(form.run_all_mailboxes)
+      const extra: Record<string, any> = {
+        identity_provider: form.identity_provider,
+        oauth_provider: form.oauth_provider,
+        oauth_email_hint: form.oauth_email_hint,
+        chrome_user_data_dir: form.chrome_user_data_dir || undefined,
+        chrome_cdp_url: form.chrome_cdp_url || undefined,
+      }
+      if (form.mail_provider) {
+        extra.mail_provider = form.mail_provider
+      }
+      if (form.sms_provider) {
+        extra.sms_provider = form.sms_provider
+      }
+      allProviderFieldKeys.forEach(fieldKey => {
+        if (form[fieldKey] !== undefined) {
+          extra[fieldKey] = form[fieldKey]
+        }
+      })
+      const res = await apiFetch('/tasks/register', {
+        method: 'POST',
+        body: JSON.stringify({
+          platform: form.platform,
+          email: form.email || null,
+          password: form.password || null,
+          count: shouldRunAllMailboxes ? 1 : form.count,
+          concurrency: shouldRunAllMailboxes ? 5 : form.concurrency,
+          run_all_mailboxes: shouldRunAllMailboxes,
+          proxy: form.proxy || null,
+          executor_type: form.executor_type,
+          captcha_solver: 'auto',
+          extra,
+        }),
+      })
+      setTask(res)
+      setPolling(true)
+    } catch (error) {
+      setSubmitError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setSubmitting(false)
+    }
   }
 
   const handleTaskDone = useCallback(async (status: string) => {
@@ -367,6 +438,10 @@ export default function Register() {
         onChange={e => {
           set(k, type === 'number' ? Number(e.target.value) : e.target.value)
           if (String(k).startsWith('sub2api_')) setSub2apiSaveState('idle')
+          if ((currentMailboxProvider?.fields || []).some(field => field.key === k)) {
+            setMailboxSaveState('idle')
+            setMailboxSaveError('')
+          }
         }}
         placeholder={placeholder}
         disabled={disabled}
@@ -388,15 +463,84 @@ export default function Register() {
     </div>
   )
 
-  const renderProviderField = (field: any) => (
-    <Input
-      key={field.key}
-      label={field.label}
-      k={field.key}
-      type={field.secret ? 'password' : 'text'}
-      placeholder={field.placeholder || ''}
-    />
-  )
+  const renderProviderField = (field: ProviderField) => {
+    const value = form[field.key] ?? ''
+    if (field.type === 'textarea') {
+      const lineCount = String(value).split(/\r?\n/).filter(line => line.trim()).length
+      return (
+        <div key={field.key}>
+          <div className="mb-1 flex items-center justify-between gap-3">
+            <label className="block text-xs text-[var(--text-muted)]">{field.label}</label>
+            {field.key.includes('pool_text') && <Badge variant="secondary">{lineCount} 行</Badge>}
+          </div>
+          {field.hint && <p className="mb-2 text-xs leading-5 text-[var(--text-muted)]">{field.hint}</p>}
+          <textarea
+            value={String(value)}
+            onChange={event => {
+              set(field.key, event.target.value)
+              setMailboxSaveState('idle')
+              setMailboxSaveError('')
+            }}
+            rows={8}
+            spellCheck={false}
+            placeholder={field.placeholder || ''}
+            className="control-surface min-h-[180px] resize-y font-mono text-xs leading-5"
+          />
+        </div>
+      )
+    }
+    if (field.type === 'toggle') {
+      const checked = configBoolean(value)
+      return (
+        <label key={field.key} className="flex items-start gap-3 text-sm text-[var(--text-primary)]">
+          <input
+            type="checkbox"
+            checked={checked}
+            onChange={event => {
+              set(field.key, event.target.checked ? 'true' : 'false')
+              setMailboxSaveState('idle')
+              setMailboxSaveError('')
+            }}
+            className="mt-0.5 h-4 w-4 accent-[var(--accent)]"
+          />
+          <span>
+            <span className="block">{field.label}</span>
+            {field.hint && <span className="mt-1 block text-xs leading-5 text-[var(--text-muted)]">{field.hint}</span>}
+          </span>
+        </label>
+      )
+    }
+    if (field.type === 'select' && field.options?.length) {
+      return (
+        <div key={field.key}>
+          <label className="mb-1 block text-xs text-[var(--text-muted)]">{field.label}</label>
+          <select
+            value={String(value)}
+            onChange={event => {
+              set(field.key, event.target.value)
+              setMailboxSaveState('idle')
+              setMailboxSaveError('')
+            }}
+            className="control-surface appearance-none"
+          >
+            {field.options.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+          </select>
+          {field.hint && <p className="mt-1 text-xs leading-5 text-[var(--text-muted)]">{field.hint}</p>}
+        </div>
+      )
+    }
+    return (
+      <div key={field.key}>
+        <Input
+          label={field.label}
+          k={field.key}
+          type={field.secret ? 'password' : 'text'}
+          placeholder={field.placeholder || ''}
+        />
+        {field.hint && <p className="mt-1 text-xs leading-5 text-[var(--text-muted)]">{field.hint}</p>}
+      </div>
+    )
+  }
 
   const summaryRegistration = registrationOptions.find(option => option.identityProvider === form.identity_provider && option.oauthProvider === form.oauth_provider)?.label || '-'
   const summaryExecutor = executorOptions.find(option => option.value === form.executor_type)?.label || '-'
@@ -533,6 +677,16 @@ export default function Register() {
                   <p className="text-xs leading-5 text-[var(--text-muted)]">{currentMailboxProvider.description}</p>
                 ) : null}
                 {(currentMailboxProvider?.fields || []).map(renderProviderField)}
+                {(currentMailboxProvider?.fields || []).length > 0 && (
+                  <div className="flex flex-wrap items-center gap-3">
+                    <Button type="button" variant="outline" onClick={saveMailboxProviderConfig} disabled={mailboxSaveState === 'saving'}>
+                      <Save className="mr-2 h-4 w-4" />
+                      {mailboxSaveState === 'saving' ? '保存中...' : '保存邮箱配置'}
+                    </Button>
+                    {mailboxSaveState === 'saved' && <span className="text-xs text-emerald-400">邮箱池配置已保存</span>}
+                    {mailboxSaveState === 'error' && <span className="text-xs text-red-400">保存失败: {mailboxSaveError}</span>}
+                  </div>
+                )}
               </CardContent>
             </Card>
           )}
@@ -616,9 +770,10 @@ export default function Register() {
                   <div className="mt-2 text-base font-medium text-[var(--text-primary)]">{summaryVerification}</div>
                 </div>
               </div>
-              <Button onClick={submit} disabled={polling} className="w-full">
-                {polling ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />注册中...</> : <><Play className="mr-2 h-4 w-4" />开始注册</>}
+              <Button onClick={submit} disabled={polling || submitting} className="w-full">
+                {polling || submitting ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />{polling ? '注册中...' : '提交中...'}</> : <><Play className="mr-2 h-4 w-4" />开始注册</>}
               </Button>
+              {submitError && <div className="text-xs leading-5 text-red-400">提交失败: {submitError}</div>}
             </CardContent>
           </Card>
 

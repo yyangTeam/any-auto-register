@@ -6,6 +6,11 @@ import json
 import re
 
 from core.datetime_utils import serialize_datetime
+from core.local_ms_mailbox import (
+    LEGACY_LOCAL_MS_POOL_PROVIDER_NAME,
+    LOCAL_MAIL_POOL_PROVIDER_NAME,
+    LocalMicrosoftMailboxPool,
+)
 from domain.accounts import (
     AccountCreateCommand,
     AccountImportLine,
@@ -39,6 +44,33 @@ def _parse_csv_row(raw: str) -> list[str]:
     return next(csv.reader([raw]))
 
 
+def _local_mailbox_reservation_keys(account: AccountRecord) -> list[str]:
+    keys: list[str] = []
+    local_provider_names = {
+        LOCAL_MAIL_POOL_PROVIDER_NAME,
+        LEGACY_LOCAL_MS_POOL_PROVIDER_NAME,
+    }
+    for resource in account.provider_resources:
+        if str(resource.get("provider_name") or "") not in local_provider_names:
+            continue
+        if str(resource.get("resource_type") or "") != "mailbox":
+            continue
+        keys.extend([
+            str(resource.get("resource_identifier") or ""),
+            str(resource.get("handle") or ""),
+        ])
+    keys.append(account.email)
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in keys:
+        key = str(value or "").strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            normalized.append(key)
+    return normalized
+
+
 class AccountsService:
     def __init__(self, repository: AccountsRepository | None = None):
         self.repository = repository or AccountsRepository()
@@ -63,7 +95,18 @@ class AccountsService:
         return self._serialize(item) if item else None
 
     def delete_account(self, account_id: int) -> dict:
-        return {"ok": self.repository.delete(account_id)}
+        account = self.repository.get(account_id)
+        if not account:
+            return {"ok": False, "released_mailboxes": []}
+
+        deleted = self.repository.delete(account_id)
+        released_mailboxes: list[str] = []
+        if deleted:
+            mailbox_pool = LocalMicrosoftMailboxPool()
+            for email in _local_mailbox_reservation_keys(account):
+                if mailbox_pool.release_email(email):
+                    released_mailboxes.append(email)
+        return {"ok": deleted, "released_mailboxes": released_mailboxes}
 
     def import_accounts(self, platform: str, lines: list[str]) -> dict:
         parsed: list[AccountImportLine] = []

@@ -84,37 +84,42 @@ class ChatGPTProtocolMailboxWorker:
             phone_callback=phone_callback,
         )
 
-    def _mailbox_credential_password(self) -> str:
+    def _mailbox_credentials(self) -> dict:
         extra = dict(getattr(self.engine.email_service._mailbox_account, "extra", {}) or {})
         provider_account = dict(extra.get("provider_account") or {})
-        credentials = dict(provider_account.get("credentials") or {})
-        return str(credentials.get("password") or "")
+        return dict(provider_account.get("credentials") or {})
 
-    def _is_existing_account_pool(self) -> bool:
-        provider = str(getattr(self.engine.email_service.service_type, "value", "") or "").strip()
-        extra = dict(getattr(self.engine.email_service._mailbox_account, "extra", {}) or {})
-        provider_account = dict(extra.get("provider_account") or {})
-        provider_resource = dict(extra.get("provider_resource") or {})
-        names = {
-            provider,
-            str(provider_account.get("provider_name") or ""),
-            str(provider_resource.get("provider_name") or ""),
-        }
-        return bool({"local_ms_pool", "local_mail_pool"} & names)
+    @staticmethod
+    def _uses_existing_account_login(credentials: dict) -> bool:
+        password = str(credentials.get("password") or "").strip()
+        totp_secret = str(credentials.get("totp_secret") or "").strip()
+        totp_url = str(credentials.get("totp_url") or "").strip()
+        login_mode = str(credentials.get("login_mode") or "").strip()
+        return bool(
+            (password and (totp_secret or totp_url))
+            or (password and login_mode == "password_or_email_otp")
+        )
 
     def run(self, *, email: str, password: str):
         self.engine.email = email
-        credential_password = self._mailbox_credential_password()
+        credentials = self._mailbox_credentials()
+        credential_password = str(credentials.get("password") or "")
+        credential_totp_secret = str(credentials.get("totp_secret") or "")
+        credential_totp_url = str(credentials.get("totp_url") or "")
         self.engine.password = credential_password or password
+        self.engine.totp_secret = credential_totp_secret
+        self.engine.totp_url = credential_totp_url
 
-        # 本地邮箱池导入的是“已注册好的号”。这里直接走 Codex OAuth 登录，
-        # 不再走 ChatGPT create-account 注册链路，避免 invalid_state / user_exists 类错误。
+        # 按每条邮箱的凭据能力选择分支：纯接码邮箱注册新号，密码/MFA 或
+        # 密码+接码 URL 的已有账号走 Codex 登录，页面需要邮件码时再读取 URL。
         success = False
         try:
-            if self._is_existing_account_pool():
+            if self._uses_existing_account_login(credentials):
                 result = self.engine.login_existing_via_codex_auth(
                     email=email,
                     password=credential_password or "",
+                    totp_secret=credential_totp_secret,
+                    totp_url=credential_totp_url,
                 )
             else:
                 result = self.engine.run()

@@ -881,7 +881,7 @@ def _auto_followup_windsurf_payment(
         logger.add_cashier_url(cashier_url)
 
 
-def _release_failed_mailbox_reservation(platform: Any, logger: "TaskLogger") -> None:
+def _release_failed_mailbox_reservation(platform: Any, logger: "TaskLogger", error: str = "") -> None:
     """Release a local mailbox-pool reservation when the account was not saved."""
     try:
         identity = getattr(platform, "_last_identity", None)
@@ -890,7 +890,7 @@ def _release_failed_mailbox_reservation(platform: Any, logger: "TaskLogger") -> 
         release = getattr(mailbox, "release_email", None)
         if mailbox_account is None or not callable(release):
             return
-        released = release(mailbox_account)
+        released = release(mailbox_account, error=error)
         if released:
             email = str(getattr(mailbox_account, "email", "") or "")
             logger.log(f"失败任务已释放邮箱占用: {email}", level="warning")
@@ -898,11 +898,40 @@ def _release_failed_mailbox_reservation(platform: Any, logger: "TaskLogger") -> 
         logger.log(f"释放邮箱占用失败: {exc}", level="warning")
 
 
+def _mark_successful_mailbox(platform: Any, email: str) -> None:
+    """Remove a completed account from the managed pending/retry queue."""
+    mailbox = getattr(platform, "mailbox", None)
+    mark_succeeded = getattr(mailbox, "mark_email_succeeded", None)
+    if callable(mark_succeeded):
+        mark_succeeded(email)
+
+
+def _registration_email(platform: Any, fallback: str = "") -> str:
+    identity = getattr(platform, "_last_identity", None)
+    identity_email = str(getattr(identity, "email", "") or "").strip()
+    if identity_email:
+        return identity_email
+    mailbox_account = getattr(identity, "mailbox_account", None)
+    mailbox_email = str(getattr(mailbox_account, "email", "") or "").strip()
+    return mailbox_email or str(fallback or "").strip()
+
+
+def _registration_source_row(platform: Any, email: str) -> str:
+    mailbox = getattr(platform, "mailbox", None)
+    source_lookup = getattr(mailbox, "source_row_for_email", None)
+    if not callable(source_lookup):
+        return ""
+    try:
+        return str(source_lookup(email) or "").strip()
+    except Exception:
+        return ""
+
+
 def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     from core.proxy_pool import proxy_pool
 
     count = max(int(payload.get("count", 1) or 1), 1)
-    concurrency = min(max(int(payload.get("concurrency", 1) or 1), 1), count, 5)
+    concurrency = min(max(int(payload.get("concurrency", 1) or 1), 1), count, 3)
     platform_name = str(payload.get("platform", ""))
     email = payload.get("email") or None
     password = payload.get("password") or None
@@ -914,7 +943,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     if _bool_config(payload.get("run_all_mailboxes"), False):
         logger.log(f"跑完所有邮箱: 本次共 {count} 个，并发 {concurrency}", event_type="summary")
     sms_provider_key, sms_settings = _resolve_sms_provider_for_task(extra)
-    herosms_enabled = sms_provider_key == "herosms" and bool(str(sms_settings.get("herosms_api_key") or "").strip())
+    herosms_enabled = sms_provider_key in {"herosms", "herosms_api"} and bool(str(sms_settings.get("herosms_api_key") or "").strip())
     hero_extra_max = max(_int_config(sms_settings.get("register_phone_extra_max"), 3), 0) if herosms_enabled else 0
     hero_reuse_to_max = False
     target_success = count
@@ -936,6 +965,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
 
     success = 0
     errors: list[str] = []
+    failed_mailboxes: dict[str, dict[str, str]] = {}
+    failed_mailboxes_lock = threading.Lock()
 
     # Pre-create a shared mailbox instance for the entire task to avoid
     # concurrent initialization issues (e.g. MoeMail auto-registering
@@ -955,6 +986,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 extra=extra,
                 proxy=proxy or None,
             )
+            if count > 1 and hasattr(shared_mailbox, "avoid_repeat"):
+                shared_mailbox.avoid_repeat = True
     except Exception as exc:
         logger.log(f"邮箱初始化失败: {exc}", level="error")
         logger.finish(TASK_STATUS_FAILED, error=f"邮箱初始化失败: {exc}")
@@ -973,13 +1006,23 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             if platform_name == "chatgpt":
                 account_extra = dict(getattr(account, "extra", {}) or {})
                 if not str(account_extra.get("refresh_token") or account_extra.get("rt") or "").strip():
-                    _release_failed_mailbox_reservation(platform, logger)
+                    _release_failed_mailbox_reservation(
+                        platform,
+                        logger,
+                        "ChatGPT/Codex 未获取到 refresh_token(rt)，不计入成功",
+                    )
                     raise RuntimeError("ChatGPT/Codex 未获取到 refresh_token(rt)，不计入成功")
+                source_trade_no = str(extra.get("source_trade_no") or "").strip()
+                if source_trade_no:
+                    account_extra["source_trade_no"] = source_trade_no
+                    account_extra["source"] = str(extra.get("source") or "ldxp_public_order")
+                    account.extra = account_extra
             if logger.is_cancel_requested():
                 _release_failed_mailbox_reservation(platform, logger)
                 logger.log("任务已终止，跳过保存本次账号", level="warning")
                 return "__cancel_requested__"
             saved_account = save_account(account)
+            _mark_successful_mailbox(platform, account.email)
             _auto_followup_windsurf_payment(
                 platform_name=platform_name,
                 payload=payload,
@@ -995,9 +1038,9 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             _auto_upload_cpa(logger, account)
             _auto_push_sub2api(logger, saved_account)
             _auto_push_any2api(logger, account)
-            extra = dict(account.extra or {})
-            overview = dict(extra.get("account_overview") or {})
-            cashier_url = str(extra.get("cashier_url") or overview.get("cashier_url") or "")
+            account_result_extra = dict(account.extra or {})
+            overview = dict(account_result_extra.get("account_overview") or {})
+            cashier_url = str(account_result_extra.get("cashier_url") or overview.get("cashier_url") or "")
             if cashier_url:
                 logger.log(f"  [升级链接] {cashier_url}")
                 logger.add_cashier_url(cashier_url)
@@ -1008,18 +1051,28 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             if logger.is_cancel_requested():
                 _release_failed_mailbox_reservation(platform, logger)
                 return "__cancel_requested__"
-            _release_failed_mailbox_reservation(platform, logger)
             error = str(exc)
+            failed_email = _registration_email(platform, email or "")
+            failed_source_row = _registration_source_row(platform, failed_email)
+            _release_failed_mailbox_reservation(platform, logger, error)
             logger.record_error(error)
             logger.log(f"✗ 注册失败: {error}", level="error")
-            _save_task_log(platform_name, email or "", "failed", error=error)
+            if failed_email:
+                with failed_mailboxes_lock:
+                    failed_mailboxes[failed_email.lower()] = {
+                        "email": failed_email,
+                        "error": error,
+                        "source_row": failed_source_row,
+                    }
+            _save_task_log(platform_name, failed_email, "failed", error=error)
             return error
 
     try:
         submitted = 0
         completed = 0
         futures: dict[Any, int] = {}
-        max_attempts = max(count if not herosms_enabled else max_success * 3, 1)
+        exhaustive_mailbox_run = _bool_config(payload.get("run_all_mailboxes"), False)
+        max_attempts = max(count if exhaustive_mailbox_run or not herosms_enabled else max_success * 3, 1)
 
         def _hero_phone_alive() -> bool:
             if not (herosms_enabled and hero_reuse_to_max):
@@ -1092,15 +1145,26 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         logger.finish(TASK_STATUS_FAILED, error=str(exc))
         return
 
+    failed_items = list(failed_mailboxes.values())
+    result_data = {
+        "target_count": target_success,
+        "attempts": submitted,
+        "success": success,
+        "fail": len(errors),
+        "failed_email_count": len(failed_items),
+        "failed_emails": failed_items,
+    }
     if herosms_enabled:
-        logger.set_result_data({
-            "target_count": target_success,
-            "attempts": submitted,
-            "success": success,
-            "fail": len(errors),
+        result_data.update({
             "extra_success": max(0, success - target_success),
             "hero_sms_reuse": False,
         })
+    logger.set_result_data(result_data)
+    if failed_items:
+        logger.log(
+            f"失败邮箱统计: 去重后 {len(failed_items)} 个，已释放占用，将在下一批继续尝试",
+            event_type="summary",
+        )
     summary = f"完成: 成功 {success} 个, 失败 {len(errors)} 个"
     logger.log(summary, event_type="summary")
     if logger.is_cancel_requested():

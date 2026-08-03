@@ -19,7 +19,20 @@ def _default_database_url() -> str:
 
 
 DATABASE_URL = os.getenv("ACCOUNT_MANAGER_DATABASE_URL", _default_database_url())
-engine = create_engine(DATABASE_URL)
+_IS_SQLITE = DATABASE_URL.startswith("sqlite:")
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False, "timeout": 30} if _IS_SQLITE else {},
+)
+
+if _IS_SQLITE:
+    # Registration tasks write logs and account state from several worker threads.
+    # WAL lets readers continue during writes, while busy_timeout makes concurrent
+    # writers wait instead of aborting the whole batch immediately.
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        connection.exec_driver_sql("PRAGMA synchronous=NORMAL")
+        connection.exec_driver_sql("PRAGMA busy_timeout=30000")
 
 
 class AccountModel(SQLModel, table=True):

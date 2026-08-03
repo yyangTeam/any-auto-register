@@ -1,7 +1,7 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import { createPortal } from 'react-dom'
 import { useParams } from 'react-router-dom'
-import { getConfig, getConfigOptions, getPlatforms } from '@/lib/app-data'
+import { getConfig, getConfigOptions, getPlatforms, invalidateConfigOptionsCache } from '@/lib/app-data'
 import type { ConfigOptionsResponse } from '@/lib/config-options'
 import { getCaptchaStrategyLabel } from '@/lib/config-options'
 import { apiDownload, apiFetch, triggerBrowserDownload } from '@/lib/utils'
@@ -11,7 +11,8 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { getTaskStatusText, TASK_STATUS_VARIANTS } from '@/lib/tasks'
-import { RefreshCw, Copy, ExternalLink, Download, Upload, Plus, X, Mail, Trash2, Zap } from 'lucide-react'
+import { RefreshCw, Copy, ExternalLink, Download, Upload, Plus, X, Mail, Trash2, Zap, Save } from 'lucide-react'
+import { MailboxRegistrationPool } from './Settings'
 
 const STATUS_VARIANT: Record<string, any> = {
   registered: 'default', trial: 'success', subscribed: 'success',
@@ -206,6 +207,10 @@ function RegisterModal({
   const [taskId, setTaskId] = useState<string | null>(null)
   const [done, setDone] = useState(false)
   const [starting, setStarting] = useState(false)
+  const [startError, setStartError] = useState('')
+  const [mailPoolText, setMailPoolText] = useState('')
+  const [mailPoolSaveState, setMailPoolSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+  const [mailPoolSaveError, setMailPoolSaveError] = useState('')
 
   const supportedExecutors: string[] = platformMeta?.supported_executors || []
   const registrationOptions = buildRegistrationOptions(platformMeta)
@@ -232,7 +237,17 @@ function RegisterModal({
         if (!active) return
         setConfig(cfg || {})
         if (options) {
-          setConfigOptions(options)
+          const loadedOptions = options as ConfigOptionsResponse
+          setConfigOptions(loadedOptions)
+          const mailboxSetting = (loadedOptions.mailbox_settings || []).find(item => item.is_default) || loadedOptions.mailbox_settings?.[0] || null
+          const mailboxDefinition = (loadedOptions.mailbox_providers || []).find(item => item.value === mailboxSetting?.provider_key) || null
+          if (mailboxSetting && ['local_ms_pool', 'local_mail_pool'].includes(String(mailboxDefinition?.driver_type || ''))) {
+            const poolFieldKey = mailboxDefinition?.fields?.find(
+              field => ['local_ms_pool_text', 'local_mail_pool_text'].includes(field.key),
+            )?.key || 'local_ms_pool_text'
+            const merged = { ...(mailboxSetting.config || {}), ...(mailboxSetting.auth || {}) }
+            setMailPoolText(String(merged[poolFieldKey] || ''))
+          }
         }
       })
       .catch(() => {
@@ -315,9 +330,55 @@ function RegisterModal({
   }, [selection.identityProvider, selection.oauthProvider, selection.executorType, supportedExecutors, reusableBrowser])
 
   const defaultMailboxProvider = (configOptions.mailbox_settings || []).find(item => item.is_default) || configOptions.mailbox_settings?.[0] || null
+  const defaultMailboxDefinition = (configOptions.mailbox_providers || []).find(
+    item => item.value === defaultMailboxProvider?.provider_key,
+  ) || null
+  const isLocalMailboxPool = ['local_ms_pool', 'local_mail_pool'].includes(
+    String(defaultMailboxDefinition?.driver_type || ''),
+  )
+  const mailPoolFieldKey = defaultMailboxDefinition?.fields?.find(
+    field => ['local_ms_pool_text', 'local_mail_pool_text'].includes(field.key),
+  )?.key || 'local_ms_pool_text'
+  const mailPoolLineCount = mailPoolText.split(/\r?\n/).filter(line => line.trim()).length
+
+  const saveMailboxPool = async () => {
+    if (!defaultMailboxProvider || !defaultMailboxDefinition || !isLocalMailboxPool) return true
+    setMailPoolSaveState('saving')
+    setMailPoolSaveError('')
+    try {
+      const nextAuth = { ...(defaultMailboxProvider.auth || {}) }
+      const nextConfig = { ...(defaultMailboxProvider.config || {}) }
+      const field = (defaultMailboxDefinition.fields || []).find(item => item.key === mailPoolFieldKey)
+      if (field?.category === 'auth') nextAuth[mailPoolFieldKey] = mailPoolText
+      else nextConfig[mailPoolFieldKey] = mailPoolText
+      await apiFetch('/provider-settings', {
+        method: 'PUT',
+        body: JSON.stringify({
+          id: defaultMailboxProvider.id,
+          provider_type: 'mailbox',
+          provider_key: defaultMailboxProvider.provider_key,
+          display_name: defaultMailboxProvider.display_name,
+          auth_mode: defaultMailboxProvider.auth_mode,
+          enabled: defaultMailboxProvider.enabled,
+          is_default: defaultMailboxProvider.is_default,
+          config: nextConfig,
+          auth: nextAuth,
+          metadata: defaultMailboxProvider.metadata || {},
+        }),
+      })
+      invalidateConfigOptionsCache()
+      setMailPoolSaveState('saved')
+      return true
+    } catch (error) {
+      setMailPoolSaveState('error')
+      setMailPoolSaveError(error instanceof Error ? error.message : String(error))
+      return false
+    }
+  }
 
   const start = async () => {
     const shouldRunAllMailboxes = selection.identityProvider === 'mailbox' && runAllMailboxes
+    setStartError('')
     setStarting(true)
     try {
       const cfg = config || {}
@@ -332,7 +393,9 @@ function RegisterModal({
         if (!defaultMailboxProvider?.provider_key) {
           throw new Error('未配置默认邮箱 provider，请先到设置页启用一个邮箱 provider')
         }
+        if (isLocalMailboxPool && !(await saveMailboxPool())) return
         extra.mail_provider = defaultMailboxProvider.provider_key
+        if (isLocalMailboxPool) extra[mailPoolFieldKey] = mailPoolText
       }
       const res = await apiFetch('/tasks/register', {
         method: 'POST',
@@ -348,6 +411,15 @@ function RegisterModal({
         }),
       })
       setTaskId(res.task_id)
+    } catch (error) {
+      let message = error instanceof Error ? error.message : String(error)
+      try {
+        const payload = JSON.parse(message)
+        message = payload?.detail || payload?.error || message
+      } catch {
+        // The backend may also return a plain-text error.
+      }
+      setStartError(message || '启动注册任务失败')
     } finally { setStarting(false) }
   }
 
@@ -450,6 +522,43 @@ function RegisterModal({
                   </label>
                 )}
 
+                {selection.identityProvider === 'mailbox' && isLocalMailboxPool && (
+                  <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-pane)]/55 p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-[var(--text-primary)]">邮箱池</div>
+                        <div className="mt-1 text-xs text-[var(--text-muted)]">每行一个账号；密码 + MFA 直接登录已有账号，密码 + 接码 URL 会按页面要求提交密码或读取邮件码。纯接码 URL、Microsoft OAuth、IMAP 用于新账号注册。</div>
+                      </div>
+                      <Badge variant="secondary">{mailPoolLineCount} 行</Badge>
+                    </div>
+                    <textarea
+                      value={mailPoolText}
+                      onChange={event => {
+                        setMailPoolText(event.target.value)
+                        setMailPoolSaveState('idle')
+                        setMailPoolSaveError('')
+                        setStartError('')
+                      }}
+                      rows={8}
+                      spellCheck={false}
+                      placeholder="email@outlook.com----password----..."
+                      className="control-surface mt-3 min-h-[180px] resize-y font-mono text-xs leading-5"
+                    />
+                    <div className="mt-3 flex flex-wrap items-center gap-3">
+                      <Button type="button" variant="outline" size="sm" onClick={saveMailboxPool} disabled={mailPoolSaveState === 'saving'}>
+                        <Save className="mr-1.5 h-3.5 w-3.5" />
+                        {mailPoolSaveState === 'saving' ? '保存中...' : '保存邮箱池'}
+                      </Button>
+                      {mailPoolSaveState === 'saved' && <span className="text-xs text-emerald-400">邮箱池已保存</span>}
+                      {mailPoolSaveState === 'error' && <span className="text-xs text-red-400">保存失败: {mailPoolSaveError}</span>}
+                    </div>
+                  </div>
+                )}
+
+                {platform === 'chatgpt' && selection.identityProvider === 'mailbox' && isLocalMailboxPool && (
+                  <MailboxRegistrationPool />
+                )}
+
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <label className="text-xs text-[var(--text-muted)] block mb-1">注册数量</label>
@@ -475,6 +584,12 @@ function RegisterModal({
                     <div className="mt-2 text-amber-400">后台浏览器自动依赖 Chrome Profile 或 Chrome CDP，未配置时只允许可视浏览器自动。</div>
                   )}
                 </div>
+
+                {startError && (
+                  <div role="alert" className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+                    {startError}
+                  </div>
+                )}
 
                 <Button
                   onClick={start}
