@@ -55,7 +55,10 @@ FLYSMS_PICKUP_HOST = "flysms.xyz"
 FLYSMS_PICKUP_PATH = "/icloud/pickup"
 FLYSMS_MESSAGES_URL = "https://flysms.xyz/icloud/api/pickup/messages"
 FLYSMS_MESSAGE_LIMIT = 10
-FLYSMS_OTP_INGESTION_GRACE_SECONDS = 60
+# Codex OTP messages have taken more than five minutes to reach iCloud even
+# though FlySMS ingested them within seconds. Keep this provider-specific so
+# normal Graph/IMAP mailboxes retain the caller's shorter timeout.
+FLYSMS_OTP_DELIVERY_TIMEOUT_SECONDS = 480
 FLYSMS_TOKEN_RE = re.compile(r"^tok_[A-Za-z0-9_-]{1,508}$")
 _IGNORABLE_TRAILING_STATUSES = {
     "trial", "plus", "paid", "success", "failed", "registered", "active",
@@ -1731,15 +1734,28 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             entry = self._entry_for_account(account)
             poll_interval = 10 if self._mailroom_public_endpoint(entry.icloud_api_url) else 5
             is_flysms = bool(_parse_flysms_pickup_url(entry.icloud_api_url, entry.email))
+            provider_name = "flysms" if is_flysms else entry.source
         except Exception:
             poll_interval = 5
             is_flysms = False
-        effective_timeout = timeout + FLYSMS_OTP_INGESTION_GRACE_SECONDS if is_flysms else timeout
+            provider_name = "unknown"
+        effective_timeout = max(timeout, FLYSMS_OTP_DELIVERY_TIMEOUT_SECONDS) if is_flysms else timeout
+        logger.info(
+            "邮箱验证码等待开始: email=%s provider=%s timeout=%ss before_ids=%s",
+            account.email,
+            provider_name,
+            effective_timeout,
+            len(seen),
+        )
         # Microsoft Graph 的 receivedDateTime 与本机触发时间之间可能有 1-2 秒偏差，
         # 给少量宽限；但仍然拒绝明显早于本次 OTP 发送的旧验证码。
         min_received_ts = (float(otp_sent_at) - 15.0) if otp_sent_at else 0.0
         last_poll_error = ""
         last_error_log_at = 0.0
+        poll_count = 0
+        last_message_count = 0
+        last_new_message_count = 0
+        newest_received_ts = 0.0
         while time.time() - start < effective_timeout:
             try:
                 mails = self._messages(account)
@@ -1752,11 +1768,16 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                     last_error_log_at = now
                 time.sleep(poll_interval)
                 continue
+            poll_count += 1
+            last_message_count = len(mails)
+            last_new_message_count = 0
             for mail in mails:
                 mid = self._message_id(mail)
                 if mid and mid in seen:
                     continue
+                last_new_message_count += 1
                 received_ts = self._message_received_ts(mail)
+                newest_received_ts = max(newest_received_ts, received_ts)
                 if min_received_ts and received_ts and received_ts < min_received_ts:
                     if mid:
                         seen.add(mid)
@@ -1774,6 +1795,18 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 if mid and not mail.get("_detail_pending"):
                     seen.add(mid)
             time.sleep(poll_interval)
+        logger.warning(
+            "邮箱验证码等待超时: email=%s provider=%s timeout=%ss polls=%s "
+            "last_messages=%s last_new=%s newest_received=%s last_error=%s",
+            account.email,
+            provider_name,
+            effective_timeout,
+            poll_count,
+            last_message_count,
+            last_new_message_count,
+            datetime.fromtimestamp(newest_received_ts, timezone.utc).isoformat() if newest_received_ts else "none",
+            last_poll_error or "none",
+        )
         raise TimeoutError(f"等待验证码超时 ({effective_timeout}s)")
 
     def wait_for_link(

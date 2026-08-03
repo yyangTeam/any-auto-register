@@ -8,7 +8,7 @@ import pytest
 from core.base_mailbox import MailboxAccount
 from core.local_ms_mailbox import (
     FLYSMS_MESSAGES_URL,
-    FLYSMS_OTP_INGESTION_GRACE_SECONDS,
+    FLYSMS_OTP_DELIVERY_TIMEOUT_SECONDS,
     LocalMicrosoftMailboxEntry,
     LocalMicrosoftMailboxPool,
     OUTLOOK_IMAP_SCOPE,
@@ -208,7 +208,7 @@ def test_flysms_pickup_retries_detail_until_ingestion_finishes(monkeypatch):
     assert detail_calls == 2
 
 
-def test_flysms_wait_for_code_adds_ingestion_grace(monkeypatch):
+def test_flysms_wait_for_code_uses_delivery_timeout(monkeypatch):
     entry = parse_xinlan_common_rows(
         "relay@icloud.com------"
         "https://flysms.xyz/icloud/pickup#email=relay%40icloud.com&key=tok_test-key"
@@ -225,7 +225,7 @@ def test_flysms_wait_for_code_adds_ingestion_grace(monkeypatch):
         lambda seconds: clock.__setitem__(0, clock[0] + seconds),
     )
 
-    expected_timeout = 120 + FLYSMS_OTP_INGESTION_GRACE_SECONDS
+    expected_timeout = FLYSMS_OTP_DELIVERY_TIMEOUT_SECONDS
     with pytest.raises(TimeoutError, match=rf"\({expected_timeout}s\)"):
         mailbox.wait_for_code(account, timeout=120)
 
