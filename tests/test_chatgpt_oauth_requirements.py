@@ -338,6 +338,113 @@ def test_switch_login_password_to_otp_rejects_html_fallback_response(monkeypatch
     assert any("button:Continue" in message for message in logs)
 
 
+def test_submit_otp_accepts_reset_new_password_transition(monkeypatch):
+    class FakeLocator:
+        def __init__(self):
+            self.value = ""
+
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            return 1
+
+        def wait_for(self, **kwargs):
+            return None
+
+        def click(self, **kwargs):
+            return None
+
+        def fill(self, value):
+            self.value = value
+
+        def type(self, value, **kwargs):
+            self.value += value
+
+        def input_value(self):
+            return self.value
+
+    class FakePage:
+        def __init__(self):
+            self.url = "https://auth.openai.com/email-verification"
+            self.input = FakeLocator()
+
+        def wait_for_load_state(self, *args, **kwargs):
+            return None
+
+        def locator(self, selector):
+            return self.input
+
+        def get_by_label(self, *args, **kwargs):
+            return self.input
+
+        def get_by_role(self, *args, **kwargs):
+            return self.input
+
+    page = FakePage()
+    monkeypatch.setattr(browser_register_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(browser_register_module, "_browser_pause", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        browser_register_module,
+        "_click_first",
+        lambda *args, **kwargs: setattr(page, "url", "https://auth.openai.com/reset-password/new-password") or 'button[type="submit"]',
+    )
+
+    result = browser_register_module._submit_otp_via_page(page, "654321", lambda message: None)
+
+    assert result["ok"] is True
+    assert result["url"] == "https://auth.openai.com/reset-password/new-password"
+
+
+def test_reset_existing_account_password_completes_verified_flow(monkeypatch):
+    page = SimpleNamespace(url="https://auth.openai.com/log-in/password")
+    filled = []
+    otp_calls = []
+
+    def click_first(page, selectors, timeout=10):
+        first = selectors[0]
+        if first == 'a[href="/reset-password"]':
+            page.url = "https://auth.openai.com/reset-password"
+        elif "send_otp" in first:
+            page.url = "https://auth.openai.com/email-verification"
+        elif first == 'button[type="submit"]':
+            page.url = "https://auth.openai.com/reset-password/success"
+        elif first == 'a[href="/log-in/password"]':
+            page.url = "https://auth.openai.com/log-in/password"
+        else:
+            pytest.fail(f"unexpected selectors: {selectors}")
+        return first
+
+    def submit_otp(page, code, log):
+        otp_calls.append(code)
+        page.url = "https://auth.openai.com/reset-password/new-password"
+        return {"ok": True, "status": 200, "url": page.url, "data": None, "text": ""}
+
+    monkeypatch.setattr(browser_register_module, "_click_first", click_first)
+    monkeypatch.setattr(browser_register_module, "_submit_otp_via_page", submit_otp)
+    monkeypatch.setattr(
+        browser_register_module,
+        "_fill_input_like_user",
+        lambda page, selector, value: filled.append((selector, value)) or True,
+    )
+
+    result = browser_register_module._reset_existing_account_password(
+        page,
+        "GeneratedRegistrationPassword123!",
+        lambda: "654321",
+        lambda message: None,
+    )
+
+    assert result["ok"] is True
+    assert otp_calls == ["654321"]
+    assert filled == [
+        ('input[name="new-password"]', "GeneratedRegistrationPassword123!"),
+        ('input[name="confirm-password"]', "GeneratedRegistrationPassword123!"),
+    ]
+    assert page.url == "https://auth.openai.com/log-in/password"
+
+
 def test_passwordless_login_click_is_skipped_on_email_otp_page(monkeypatch):
     page = SimpleNamespace(url="https://auth.openai.com/email-verification")
     monkeypatch.setattr(
@@ -370,6 +477,11 @@ def test_browser_registration_uses_known_existing_login_password(monkeypatch):
     monkeypatch.setattr(browser_register_module, "_start_browser_signup_via_page", lambda *args: next(states))
     monkeypatch.setattr(browser_register_module, "_get_cookies", lambda page: {})
     monkeypatch.setattr(browser_register_module, "_recover_signup_password_page", lambda *args: False)
+    monkeypatch.setattr(
+        browser_register_module,
+        "_reset_existing_account_password",
+        lambda *args, **kwargs: pytest.fail("known-password accounts must not reset their password"),
+    )
 
     def submit_password(page, password, log):
         submitted.append(password)
@@ -396,6 +508,59 @@ def test_browser_registration_uses_known_existing_login_password(monkeypatch):
 
     assert submitted == ["KnownChatGPTPassword123!"]
     assert result["account_password"] == "KnownChatGPTPassword123!"
+
+
+def test_browser_registration_resets_password_when_email_otp_login_is_disabled(monkeypatch):
+    class FakePage:
+        url = "https://auth.openai.com/log-in/password"
+
+        def evaluate(self, script):
+            return "Test User Agent"
+
+    page = FakePage()
+    submitted = []
+    resets = []
+    monkeypatch.setattr(browser_register_module, "_seed_browser_device_id", lambda *args: None)
+    monkeypatch.setattr(
+        browser_register_module,
+        "_start_browser_signup_via_page",
+        lambda *args: {"page_type": "login_password", "current_url": page.url},
+    )
+    monkeypatch.setattr(browser_register_module, "_get_cookies", lambda page: {})
+    monkeypatch.setattr(browser_register_module, "_recover_signup_password_page", lambda *args: False)
+    monkeypatch.setattr(browser_register_module, "_switch_login_password_to_otp", lambda *args: False)
+
+    def reset_password(page, password, otp_callback, log):
+        resets.append(password)
+        page.url = "https://auth.openai.com/log-in/password"
+        return {"ok": True, "url": page.url, "text": ""}
+
+    def submit_password(page, password, log):
+        submitted.append(password)
+        page.url = "http://localhost/callback?code=oauth-code"
+        return {"ok": True, "status": 200, "url": page.url, "data": None, "text": ""}
+
+    monkeypatch.setattr(browser_register_module, "_reset_existing_account_password", reset_password)
+    monkeypatch.setattr(browser_register_module, "_submit_oauth_password_direct", submit_password)
+    monkeypatch.setattr(
+        browser_register_module,
+        "_derive_registration_state_from_page",
+        lambda page: {"page_type": "login_password", "current_url": page.url},
+    )
+    monkeypatch.setattr(browser_register_module, "_handle_post_signup_onboarding", lambda *args: None)
+
+    result = browser_register_module._browser_registration_flow(
+        page,
+        "user@icloud.com",
+        "GeneratedRegistrationPassword123!",
+        lambda: "654321",
+        None,
+        lambda message: None,
+    )
+
+    assert resets == ["GeneratedRegistrationPassword123!"]
+    assert submitted == ["GeneratedRegistrationPassword123!"]
+    assert result["account_password"] == "GeneratedRegistrationPassword123!"
 
 
 def test_browser_registration_preserves_created_password_when_phone_step_is_skipped(monkeypatch):

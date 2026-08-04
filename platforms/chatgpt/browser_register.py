@@ -864,6 +864,10 @@ def _is_login_password_url(url: str) -> bool:
     return bool(re.search(r"(?:auth|accounts)\.openai\.com/.*log-?in/password", str(url or ""), flags=re.I))
 
 
+def _is_reset_new_password_url(url: str) -> bool:
+    return "/reset-password/new-password" in str(url or "").lower()
+
+
 def _build_manual_flow_state(page_type: str, current_url: str) -> dict:
     state = _extract_flow_state(None, current_url)
     state["page_type"] = page_type
@@ -1064,6 +1068,104 @@ def _switch_login_password_to_otp(page, log, *, timeout: float = 8) -> bool:
         log(f"OAuth 密码验证页直接发送邮箱验证码失败: {exc}")
     log(f"OAuth 密码验证页可见控件: {_passwordless_control_summary(page)}")
     return False
+
+
+def _reset_existing_account_password(page, password: str, otp_callback, log) -> dict:
+    """Recover a password-only existing account through OpenAI's reset flow."""
+    new_password = str(password or "").strip()
+    if not new_password:
+        return {"ok": False, "url": str(page.url or ""), "text": "重置密码为空"}
+    if not otp_callback:
+        return {"ok": False, "url": str(page.url or ""), "text": "重置密码需要邮箱验证码但没有 otp_callback"}
+
+    forgot_selector = _click_first(
+        page,
+        [
+            'a[href="/reset-password"]',
+            'a[href*="/reset-password"]',
+            'a:has-text("Forgot password")',
+            'button:has-text("Forgot password")',
+            'a:has-text("忘记密码")',
+            'button:has-text("忘记密码")',
+        ],
+        timeout=8,
+    )
+    if not forgot_selector:
+        return {"ok": False, "url": str(page.url or ""), "text": "登录密码页未找到 Forgot password 入口"}
+    log(f"已有账号不支持验证码登录，进入密码重置: {forgot_selector}")
+
+    send_selector = _click_first(
+        page,
+        [
+            'button[name="intent"][value="send_otp"]',
+            'button[value="send_otp"]',
+            'button[type="submit"]',
+            'button:has-text("Continue")',
+        ],
+        timeout=15,
+    )
+    if not send_selector:
+        return {"ok": False, "url": str(page.url or ""), "text": "重置密码页未找到发送验证码按钮"}
+    log(f"密码重置验证码已请求: {send_selector}")
+
+    if not _wait_for_url(page, "email-verification", timeout=20):
+        return {"ok": False, "url": str(page.url or ""), "text": "请求重置密码验证码后未进入验证码页"}
+
+    code = str(otp_callback() or "").strip()
+    if not code:
+        return {"ok": False, "url": str(page.url or ""), "text": "未获取到密码重置验证码"}
+    otp_resp = _submit_otp_via_page(page, code, log)
+    if not otp_resp.get("ok"):
+        return {
+            "ok": False,
+            "url": str(otp_resp.get("url") or page.url or ""),
+            "text": f"密码重置验证码校验失败: {(otp_resp.get('text') or '')[:300]}",
+        }
+    if not _is_reset_new_password_url(str(page.url or otp_resp.get("url") or "")):
+        return {"ok": False, "url": str(page.url or ""), "text": "验证码通过后未进入设置新密码页"}
+
+    new_selector = 'input[name="new-password"]'
+    confirm_selector = 'input[name="confirm-password"]'
+    if not _fill_input_like_user(page, new_selector, new_password):
+        return {"ok": False, "url": str(page.url or ""), "text": "新密码输入失败"}
+    if not _fill_input_like_user(page, confirm_selector, new_password):
+        return {"ok": False, "url": str(page.url or ""), "text": "确认新密码输入失败"}
+    log("密码重置页已填写新密码和确认密码")
+
+    submit_selector = _click_first(
+        page,
+        [
+            'button[type="submit"]',
+            'button[data-testid="continue-button"]',
+            'button:has-text("Continue")',
+        ],
+        timeout=8,
+    )
+    if not submit_selector and not _submit_form_with_fallback(page, new_selector):
+        return {"ok": False, "url": str(page.url or ""), "text": "设置新密码页未找到 Continue 按钮"}
+    if not _wait_for_url(page, "/reset-password/success", timeout=20):
+        error_text = _extract_auth_error_text(page)
+        return {
+            "ok": False,
+            "url": str(page.url or ""),
+            "text": error_text or "提交新密码后未进入成功页",
+        }
+    log("已有账号密码重置成功")
+
+    login_selector = _click_first(
+        page,
+        [
+            'a[href="/log-in/password"]',
+            'a:has-text("Log in")',
+            'button:has-text("Log in")',
+        ],
+        timeout=5,
+    )
+    if not login_selector:
+        page.goto(f"{OPENAI_AUTH}/log-in/password", wait_until="domcontentloaded", timeout=30000)
+    if not _wait_for_url(page, "log-in/password", timeout=15):
+        return {"ok": False, "url": str(page.url or ""), "text": "密码重置成功后未返回登录密码页"}
+    return {"ok": True, "url": str(page.url or ""), "text": ""}
 
 
 def _get_page_oauth_url(page) -> str:
@@ -3629,6 +3731,8 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
     while time.time() < deadline:
         current_url = page.url
         last_url = current_url or last_url
+        if _is_reset_new_password_url(current_url):
+            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         if "about-you" in current_url:
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         if "add-phone" in current_url or "chatgpt.com" in current_url or "code=" in current_url:
@@ -4396,7 +4500,11 @@ def _browser_registration_flow(
                     raise RuntimeError("已有账号需要邮件验证码，但没有 otp_callback")
                 log("注册流程落到已有账号登录密码页，切换一次性验证码登录...")
                 if not _switch_login_password_to_otp(page, log):
-                    raise RuntimeError("已有账号登录密码页未找到一次性验证码登录入口")
+                    log("一次性验证码登录不可用，回退 Forgot password 重置账号密码...")
+                    reset_resp = _reset_existing_account_password(page, password, otp_callback, log)
+                    if not reset_resp.get("ok"):
+                        raise RuntimeError(f"已有账号密码重置失败: {(reset_resp.get('text') or '')[:300]}")
+                    account_password = password
                 state = _derive_registration_state_from_page(page)
             continue
 
