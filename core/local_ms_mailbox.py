@@ -817,6 +817,72 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 self._save_state(state)
             return removed
 
+    def update_registration_row(self, email: str, source_row: str) -> dict:
+        """Replace one managed queue row while preserving its queue metadata."""
+        key = str(email or "").strip().lower()
+        if not key:
+            raise ValueError("原邮箱不能为空")
+
+        source_lines = [
+            line.strip()
+            for line in str(source_row or "").splitlines()
+            if line.strip() and not line.strip().startswith(("#", "//", "'"))
+        ]
+        if len(source_lines) != 1:
+            raise ValueError("编辑时只能提交一行邮箱数据")
+        parsed = parse_xinlan_common_rows(source_lines[0])
+        if len(parsed) != 1 or not parsed[0].usable_ready:
+            raise ValueError("邮箱数据格式无效，请提供一条可用的邮箱记录")
+        entry = parsed[0]
+
+        with self._lock:
+            state = self._state()
+            used = dict(state.get("used") or {})
+            if key in used:
+                raise RuntimeError("邮箱正在注册中，任务结束后再编辑")
+
+            pending_rows = dict(state.get("pending_rows") or {})
+            retry_rows = dict(state.get("retry_rows") or {})
+            field = "pending_rows" if key in pending_rows else "retry_rows" if key in retry_rows else ""
+            if not field:
+                raise KeyError("邮箱不在待注册池中")
+
+            configured_chunks = [self.pool_text] if self.pool_text.strip() else []
+            if self.pool_file:
+                path = Path(self.pool_file).expanduser()
+                if path.exists():
+                    configured_chunks.append(path.read_text(encoding="utf-8-sig"))
+            configured_keys = {
+                configured_entry.key
+                for configured_entry in parse_xinlan_common_rows("\n".join(configured_chunks))
+            }
+            managed_keys = (set(pending_rows) | set(retry_rows)) - {key}
+            if entry.key in configured_keys or entry.key in managed_keys or entry.key in used:
+                raise ValueError(f"邮箱已存在于邮箱池中: {entry.email}")
+
+            rows = pending_rows if field == "pending_rows" else retry_rows
+            item = dict(rows.pop(key) or {})
+            item.update({
+                "email": entry.email,
+                "raw": entry.raw,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+            rows[entry.key] = item
+            state[field] = rows
+
+            # Corrected credentials should be immediately eligible for retry.
+            cooldowns = dict(state.get("cooldowns") or {})
+            cooldowns.pop(key, None)
+            cooldowns.pop(entry.key, None)
+            state["cooldowns"] = cooldowns
+            self._save_state(state)
+
+        return {
+            "email": entry.email,
+            "source_row": entry.raw,
+            "status": "new" if field == "pending_rows" else "failed",
+        }
+
     def mark_email_succeeded(self, account_or_email) -> bool:
         email_value = getattr(account_or_email, "email", account_or_email)
         key = str(email_value or "").strip().lower()

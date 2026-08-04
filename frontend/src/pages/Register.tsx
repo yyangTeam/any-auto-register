@@ -8,8 +8,9 @@ import { TaskLogPanel } from '@/components/tasks/TaskLogPanel'
 import { Button } from '@/components/ui/button'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
-import { Play, CheckCircle, XCircle, Loader2, Orbit, Mail, ScanText, ShieldCheck, Workflow, CloudUpload, Save } from 'lucide-react'
+import { Play, CheckCircle, XCircle, Loader2, Orbit, Mail, ScanText, ShieldCheck, Workflow, CloudUpload, Save, ListChecks, X } from 'lucide-react'
 import { getTaskStatusText, isTerminalTaskStatus, TASK_STATUS_VARIANTS } from '@/lib/tasks'
+import { MailboxRegistrationPool } from './Settings'
 
 const DEFAULT_FORM: Record<string, any> = {
   platform: '',
@@ -75,6 +76,7 @@ export default function Register() {
   const [sub2apiSaveError, setSub2apiSaveError] = useState('')
   const [mailboxSaveState, setMailboxSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
   const [mailboxSaveError, setMailboxSaveError] = useState('')
+  const [mailboxQueueOpen, setMailboxQueueOpen] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [submitError, setSubmitError] = useState('')
   const handledTerminalTaskIdsRef = useRef<Set<string>>(new Set())
@@ -687,6 +689,10 @@ export default function Register() {
                     {mailboxSaveState === 'error' && <span className="text-xs text-red-400">保存失败: {mailboxSaveError}</span>}
                   </div>
                 )}
+                <Button type="button" variant="outline" onClick={() => setMailboxQueueOpen(true)}>
+                  <ListChecks className="mr-2 h-4 w-4" />
+                  编辑邮箱队列
+                </Button>
               </CardContent>
             </Card>
           )}
@@ -849,6 +855,32 @@ export default function Register() {
           )}
         </div>
       </div>
+      {mailboxQueueOpen ? (
+        <div className="dialog-backdrop" onClick={() => setMailboxQueueOpen(false)}>
+          <div
+            className="dialog-panel dialog-panel-lg flex flex-col"
+            onClick={event => event.stopPropagation()}
+          >
+            <div className="flex flex-none items-center justify-between gap-4 border-b border-[var(--border)] px-5 py-4">
+              <div>
+                <h2 className="text-base font-semibold text-[var(--text-primary)]">编辑邮箱队列</h2>
+                <p className="mt-1 text-xs text-[var(--text-muted)]">管理新入库和失败待重试邮箱。</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setMailboxQueueOpen(false)}
+                className="table-action-btn flex h-8 w-8 items-center justify-center"
+                title="关闭"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto p-4">
+              <MailboxRegistrationPool />
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 }

@@ -6,7 +6,7 @@ import { apiFetch } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Card } from '@/components/ui/card'
-import { Save, Eye, EyeOff, Mail, Shield, Cpu, Sliders, Plus, X, Orbit, Package2, MessageSquare, Inbox, Upload, RefreshCw, Copy, Trash2 } from 'lucide-react'
+import { Save, Eye, EyeOff, Mail, Shield, Cpu, Sliders, Plus, X, Orbit, Package2, MessageSquare, Inbox, Upload, RefreshCw, Copy, Pencil, Trash2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import ProviderCards from '@/components/settings/ProviderCards'
 
@@ -521,6 +521,9 @@ export function MailboxRegistrationPool() {
   const [loading, setLoading] = useState(true)
   const [importing, setImporting] = useState(false)
   const [deleting, setDeleting] = useState('')
+  const [editing, setEditing] = useState('')
+  const [editRow, setEditRow] = useState('')
+  const [savingEdit, setSavingEdit] = useState(false)
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
 
@@ -573,6 +576,34 @@ export function MailboxRegistrationPool() {
       setError(e.message || '删除失败')
     } finally {
       setDeleting('')
+    }
+  }
+
+  const beginEdit = (item: ManagedMailboxItem) => {
+    setEditing(item.email)
+    setEditRow(item.source_row)
+    setError('')
+    setNotice('')
+  }
+
+  const saveEdit = async () => {
+    if (!editing || !editRow.trim()) return
+    setSavingEdit(true)
+    setError('')
+    setNotice('')
+    try {
+      const data = await apiFetch(`/sms/mailbox-pool/${encodeURIComponent(editing)}`, {
+        method: 'PUT',
+        body: JSON.stringify({ source_row: editRow }),
+      })
+      setPool({ ...EMPTY_MAILBOX_POOL, ...data.pool, provider_key: data.provider_key, items: data.pool?.items || [] })
+      setEditing('')
+      setEditRow('')
+      setNotice(`已更新 ${data.updated?.email || editing}`)
+    } catch (e: any) {
+      setError(e.message || '编辑失败')
+    } finally {
+      setSavingEdit(false)
     }
   }
 
@@ -681,25 +712,70 @@ export function MailboxRegistrationPool() {
             {activeStatus === 'new' ? '暂无新入库邮箱' : '暂无失败待重试邮箱'}
           </div>
         ) : visibleItems.map(item => (
-          <div key={item.email} className="flex items-start gap-3 border-b border-[var(--border-soft)] px-5 py-3 last:border-b-0">
-            <div className="min-w-0 flex-1">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="break-all text-sm font-medium text-[var(--text-primary)]">{item.email}</span>
-                {item.in_use ? <Badge variant="default">注册中</Badge> : null}
-                {item.status === 'failed' ? <Badge variant="danger">失败 {item.attempts} 次</Badge> : <Badge variant="secondary">未运行</Badge>}
+          <div key={item.email} className="border-b border-[var(--border-soft)] px-5 py-3 last:border-b-0">
+            <div className="flex items-start gap-3">
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="break-all text-sm font-medium text-[var(--text-primary)]">{item.email}</span>
+                  {item.in_use ? <Badge variant="default">注册中</Badge> : null}
+                  {item.status === 'failed' ? <Badge variant="danger">失败 {item.attempts} 次</Badge> : <Badge variant="secondary">未运行</Badge>}
+                </div>
+                <div className="mt-1 text-xs text-[var(--text-muted)]">{formatTime(item.updated_at)}</div>
+                {item.error ? <div className="mt-1 break-words text-xs text-red-300">{item.error}</div> : null}
               </div>
-              <div className="mt-1 text-xs text-[var(--text-muted)]">{formatTime(item.updated_at)}</div>
-              {item.error ? <div className="mt-1 break-words text-xs text-red-300">{item.error}</div> : null}
+              <div className="flex flex-none items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => beginEdit(item)}
+                  disabled={item.in_use || savingEdit}
+                  className="table-action-btn flex h-8 w-8 items-center justify-center disabled:cursor-not-allowed disabled:opacity-40"
+                  title={item.in_use ? '注册中，暂不能编辑' : '编辑邮箱'}
+                >
+                  <Pencil className="h-3.5 w-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => deleteRow(item)}
+                  disabled={item.in_use || deleting === item.email}
+                  className="table-action-btn flex h-8 w-8 items-center justify-center disabled:cursor-not-allowed disabled:opacity-40"
+                  title={item.in_use ? '注册中，暂不能删除' : '删除邮箱'}
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              </div>
             </div>
-            <button
-              type="button"
-              onClick={() => deleteRow(item)}
-              disabled={item.in_use || deleting === item.email}
-              className="table-action-btn flex h-8 w-8 flex-none items-center justify-center disabled:cursor-not-allowed disabled:opacity-40"
-              title={item.in_use ? '注册中，暂不能删除' : '删除邮箱'}
-            >
-              <Trash2 className="h-3.5 w-3.5" />
-            </button>
+            {editing === item.email ? (
+              <div className="mt-3 rounded-lg border border-[var(--accent-edge)] bg-[var(--accent-soft)] p-3">
+                <label className="mb-2 block text-xs font-medium text-[var(--text-secondary)]">邮箱原始数据</label>
+                <textarea
+                  value={editRow}
+                  onChange={event => setEditRow(event.target.value)}
+                  rows={4}
+                  autoFocus
+                  spellCheck={false}
+                  className="control-surface resize-y font-mono text-xs"
+                />
+                <div className="mt-3 flex justify-end gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => {
+                      setEditing('')
+                      setEditRow('')
+                      setError('')
+                    }}
+                    disabled={savingEdit}
+                  >
+                    取消
+                  </Button>
+                  <Button type="button" size="sm" onClick={saveEdit} disabled={savingEdit || !editRow.trim()}>
+                    <Save className="mr-1.5 h-3.5 w-3.5" />
+                    {savingEdit ? '保存中...' : '保存修改'}
+                  </Button>
+                </div>
+              </div>
+            ) : null}
           </div>
         ))}
       </div>

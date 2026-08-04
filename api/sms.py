@@ -20,6 +20,10 @@ class MailboxPoolImportRequest(BaseModel):
     rows: str = ""
 
 
+class MailboxPoolUpdateRequest(BaseModel):
+    source_row: str = ""
+
+
 def _managed_mailbox_pool():
     from core.local_ms_mailbox import LocalMicrosoftMailboxPool
     from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
@@ -75,6 +79,27 @@ def delete_mailbox_registration_row(email: str):
         }
     except HTTPException:
         raise
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
+    except Exception as exc:
+        raise HTTPException(400, str(exc))
+
+
+@router.put("/mailbox-pool/{email}")
+def update_mailbox_registration_row(email: str, body: MailboxPoolUpdateRequest):
+    if not str(body.source_row or "").strip():
+        raise HTTPException(400, "邮箱数据不能为空")
+    try:
+        provider_key, pool = _managed_mailbox_pool()
+        updated = pool.update_registration_row(email, body.source_row)
+        return {
+            "ok": True,
+            "provider_key": provider_key,
+            "updated": updated,
+            "pool": pool.registration_pool_snapshot(),
+        }
+    except KeyError as exc:
+        raise HTTPException(404, str(exc.args[0] if exc.args else exc))
     except RuntimeError as exc:
         raise HTTPException(409, str(exc))
     except Exception as exc:

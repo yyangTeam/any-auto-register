@@ -895,6 +895,98 @@ def test_managed_registration_pool_records_failure_details(tmp_path):
     assert snapshot["items"][0]["error"] == "invalid_state"
 
 
+def test_managed_registration_pool_updates_pending_row(tmp_path):
+    mailbox = LocalMicrosoftMailboxPool(
+        state_file=str(tmp_path / "mailbox-state.json"),
+    )
+    mailbox.import_registration_rows(
+        "old@icloud.com----https://mail.example/inbox/old"
+    )
+
+    updated = mailbox.update_registration_row(
+        "old@icloud.com",
+        "new@icloud.com------https://flysms.xyz/icloud/pickup#email=new%40icloud.com&key=tok_new-key",
+    )
+
+    snapshot = mailbox.registration_pool_snapshot()
+    assert updated["email"] == "new@icloud.com"
+    assert updated["status"] == "new"
+    assert snapshot["new_count"] == 1
+    assert snapshot["items"][0]["email"] == "new@icloud.com"
+    assert "old@icloud.com" not in mailbox._state()["pending_rows"]
+
+
+def test_managed_registration_pool_updates_retry_row_and_preserves_failure(tmp_path):
+    mailbox = LocalMicrosoftMailboxPool(
+        state_file=str(tmp_path / "mailbox-state.json"),
+    )
+    mailbox.import_registration_rows(
+        "retry@icloud.com----https://mail.example/inbox/retry"
+    )
+    account = mailbox.get_email()
+    mailbox.release_email(account, error="expired pickup token")
+
+    updated = mailbox.update_registration_row(
+        "retry@icloud.com",
+        "retry@icloud.com------https://flysms.xyz/icloud/pickup#email=retry%40icloud.com&key=tok_replaced-key",
+    )
+
+    snapshot = mailbox.registration_pool_snapshot()
+    assert updated["status"] == "failed"
+    assert snapshot["failed_count"] == 1
+    assert snapshot["items"][0]["attempts"] == 1
+    assert snapshot["items"][0]["error"] == "expired pickup token"
+    assert "tok_replaced-key" in snapshot["items"][0]["source_row"]
+
+
+@pytest.mark.parametrize("source_row", [
+    "not-an-email",
+    "first@icloud.com----https://mail.example/inbox/first\nsecond@icloud.com----https://mail.example/inbox/second",
+])
+def test_managed_registration_pool_rejects_invalid_update(source_row, tmp_path):
+    mailbox = LocalMicrosoftMailboxPool(
+        state_file=str(tmp_path / "mailbox-state.json"),
+    )
+    mailbox.import_registration_rows(
+        "old@icloud.com----https://mail.example/inbox/old"
+    )
+
+    with pytest.raises(ValueError):
+        mailbox.update_registration_row("old@icloud.com", source_row)
+
+
+def test_managed_registration_pool_rejects_duplicate_update(tmp_path):
+    mailbox = LocalMicrosoftMailboxPool(
+        pool_text="configured@icloud.com----https://mail.example/inbox/configured",
+        state_file=str(tmp_path / "mailbox-state.json"),
+    )
+    mailbox.import_registration_rows(
+        "old@icloud.com----https://mail.example/inbox/old"
+    )
+
+    with pytest.raises(ValueError, match="邮箱已存在"):
+        mailbox.update_registration_row(
+            "old@icloud.com",
+            "configured@icloud.com----https://mail.example/inbox/configured-new",
+        )
+
+
+def test_managed_registration_pool_rejects_in_use_update(tmp_path):
+    mailbox = LocalMicrosoftMailboxPool(
+        state_file=str(tmp_path / "mailbox-state.json"),
+    )
+    mailbox.import_registration_rows(
+        "running@icloud.com----https://mail.example/inbox/running"
+    )
+    mailbox.get_email()
+
+    with pytest.raises(RuntimeError, match="正在注册中"):
+        mailbox.update_registration_row(
+            "running@icloud.com",
+            "changed@icloud.com----https://mail.example/inbox/changed",
+        )
+
+
 def test_get_email_by_address_reserves_the_requested_pool_row(tmp_path):
     mailbox = LocalMicrosoftMailboxPool(
         pool_text=(
