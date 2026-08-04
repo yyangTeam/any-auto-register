@@ -45,6 +45,21 @@ def _generate_chatgpt_registration_password(length: int = 16) -> str:
     return "".join(required)
 
 
+def _known_chatgpt_login_password(ctx) -> str:
+    """Return only a password known to belong to an existing ChatGPT account."""
+    if getattr(ctx, "password_supplied", False):
+        return str(getattr(ctx, "password", "") or "")
+
+    mailbox_account = getattr(getattr(ctx, "identity", None), "mailbox_account", None)
+    mailbox_extra = dict(getattr(mailbox_account, "extra", {}) or {})
+    provider_account = dict(mailbox_extra.get("provider_account") or {})
+    credentials = dict(provider_account.get("credentials") or {})
+    login_mode = str(credentials.get("login_mode") or "").strip().lower()
+    if login_mode not in {"password_mfa", "password_mfa_url", "password_or_email_otp"}:
+        return ""
+    return str(credentials.get("password") or "")
+
+
 @register
 class ChatGPTPlatform(BasePlatform):
     name = "chatgpt"
@@ -189,6 +204,7 @@ class ChatGPTPlatform(BasePlatform):
                 otp_callback=artifacts.otp_callback,
                 phone_callback=artifacts.phone_callback,
                 log_fn=ctx.log,
+                login_password=_known_chatgpt_login_password(ctx),
             ),
             browser_register_runner=lambda worker, ctx, artifacts: worker.run(
                 email=ctx.identity.email or "",

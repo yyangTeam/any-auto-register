@@ -24,6 +24,7 @@ class RegistrationContext:
     email: str | None
     password: str | None
     log_fn: Callable[[str], None]
+    password_supplied: bool = False
 
     @property
     def executor_type(self) -> str:

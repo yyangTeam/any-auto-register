@@ -4205,7 +4205,16 @@ def _submit_about_you_via_page(page, log) -> dict:
     return {"ok": False, "status": 0, "url": last_url, "data": None, "text": "about_you 提交后未跳转"}
 
 
-def _browser_registration_flow(page, email: str, password: str, otp_callback, phone_callback, log) -> dict:
+def _browser_registration_flow(
+    page,
+    email: str,
+    password: str,
+    otp_callback,
+    phone_callback,
+    log,
+    *,
+    login_password: str = "",
+) -> dict:
     device_id = str(uuid.uuid4())
     try:
         user_agent = str(page.evaluate("() => navigator.userAgent") or "").strip() or _random_chrome_ua()
@@ -4226,6 +4235,7 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, ph
     )
     log(f"注册状态起点: page={state.get('page_type') or '-'} url={(state.get('current_url') or '')[:100]}")
     register_submitted = False
+    account_password = str(login_password or "")
     seen_states: dict[str, int] = {}
 
     for step in range(12):
@@ -4247,7 +4257,9 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, ph
 
         if _is_registration_complete(state):
             _handle_post_signup_onboarding(page, log)
-            return _extract_flow_state(None, page.url)
+            completed = _extract_flow_state(None, page.url)
+            completed["account_password"] = account_password
+            return completed
 
         if _is_password_registration(state):
             if register_submitted:
@@ -4264,6 +4276,7 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, ph
             if not reg_resp.get("ok"):
                 raise RuntimeError(f"密码页提交失败: {(reg_resp.get('text') or '')[:300]}")
             register_submitted = True
+            account_password = password
             state = _extract_flow_state(reg_resp.get("data"), reg_resp.get("url", page.url))
             if not state.get("page_type") or _is_password_registration(state):
                 state = _derive_registration_state_from_page(page)
@@ -4273,13 +4286,21 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, ph
             if _recover_signup_password_page(page, log):
                 state = _derive_registration_state_from_page(page)
                 continue
-            log("注册流程落到已有账号登录密码页，按登录流程继续认证...")
-            login_resp = _submit_oauth_password_direct(page, password, log)
-            log(f"登录密码页提交状态: {login_resp.get('status', 0)}")
-            if not login_resp.get("ok"):
-                raise RuntimeError(f"登录密码页提交失败: {(login_resp.get('text') or '')[:300]}")
-            state = _extract_flow_state(login_resp.get("data"), login_resp.get("url", page.url))
-            if not state.get("page_type"):
+            if account_password:
+                log("注册流程落到已有账号登录密码页，提交已知登录密码...")
+                login_resp = _submit_oauth_password_direct(page, account_password, log)
+                log(f"登录密码页提交状态: {login_resp.get('status', 0)}")
+                if not login_resp.get("ok"):
+                    raise RuntimeError(f"登录密码页提交失败: {(login_resp.get('text') or '')[:300]}")
+                state = _extract_flow_state(login_resp.get("data"), login_resp.get("url", page.url))
+                if not state.get("page_type"):
+                    state = _derive_registration_state_from_page(page)
+            else:
+                if not otp_callback:
+                    raise RuntimeError("已有账号需要邮件验证码，但没有 otp_callback")
+                log("注册流程落到已有账号登录密码页，切换一次性验证码登录...")
+                if not _switch_login_password_to_otp(page, log):
+                    raise RuntimeError("已有账号登录密码页未找到一次性验证码登录入口")
                 state = _derive_registration_state_from_page(page)
             continue
 
@@ -4317,6 +4338,7 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, ph
                 state = _derive_registration_state_from_page(page)
             if _is_add_phone(state):
                 if not phone_callback:
+                    state["account_password"] = account_password
                     return state
                 log("about_you 后进入 add_phone，尝试短信验证...")
                 state = _handle_add_phone_challenge(
@@ -4331,6 +4353,7 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, ph
 
         if _is_add_phone(state):
             if not phone_callback:
+                state["account_password"] = account_password
                 return state
             log("注册流程进入 add_phone，尝试短信验证...")
             state = _handle_add_phone_challenge(
@@ -4366,6 +4389,7 @@ class ChatGPTBrowserRegister:
         mfa_callback: Optional[Callable[[], str]] = None,
         phone_callback: Optional[Callable[[], str]] = None,
         log_fn: Callable[[str], None] = print,
+        login_password: str = "",
     ):
         self.headless = headless
         self.proxy = proxy
@@ -4373,6 +4397,7 @@ class ChatGPTBrowserRegister:
         self.mfa_callback = mfa_callback
         self.phone_callback = phone_callback
         self.log = log_fn
+        self.login_password = str(login_password or "")
         self.last_oauth_error = ""
 
     def run(self, email: str, password: str) -> dict:
@@ -4389,8 +4414,10 @@ class ChatGPTBrowserRegister:
                 self.otp_callback,
                 self.phone_callback,
                 self.log,
+                login_password=self.login_password,
             )
             self.log(f"注册流程完成: page={final_state.get('page_type') or '-'}")
+            account_password = str(final_state.get("account_password") or "")
 
             # 获取 session token 和 cookies
             cookies_dict = _get_cookies(page)
@@ -4401,11 +4428,11 @@ class ChatGPTBrowserRegister:
             self.log("执行 Codex CLI OAuth 流程获取 token...")
 
         # 直接用全新浏览器做 OAuth（注册后的浏览器上下文不可靠）
-        codex_result = self._retry_oauth_fresh_browser(email, password)
+        codex_result = self._retry_oauth_fresh_browser(email, account_password)
         if codex_result:
             self.log(f"全新浏览器 OAuth 成功: account_id={codex_result.get('account_id','')}")
             return {
-                "email": email, "password": password,
+                "email": email, "password": account_password,
                 "account_id": codex_result.get("account_id", ""),
                 "access_token": codex_result.get("access_token", ""),
                 "refresh_token": codex_result.get("refresh_token", ""),

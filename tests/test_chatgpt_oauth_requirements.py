@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from core.base_platform import RegisterConfig
+from core.registration.helpers import build_otp_callback
 from core.totp import fetch_totp_code, generate_totp
 from platforms.chatgpt import browser_register as browser_register_module
 from platforms.chatgpt.protocol_mailbox import ChatGPTProtocolMailboxWorker
@@ -13,6 +14,7 @@ from platforms.chatgpt.plugin import (
     ChatGPTPlatform,
     _assert_complete_oauth_callback,
     _generate_chatgpt_registration_password,
+    _known_chatgpt_login_password,
 )
 from platforms.chatgpt.register import RegistrationEngine, SignupFormResult
 
@@ -186,6 +188,191 @@ def test_generate_chatgpt_registration_password_meets_openai_strength_requiremen
         assert any(ch.isupper() for ch in password)
         assert any(ch.isdigit() for ch in password)
         assert any(ch in ",._!@#" for ch in password)
+
+
+def test_otp_callback_does_not_reuse_message_consumed_by_previous_call():
+    class FakeMailbox:
+        def __init__(self):
+            self.wait_before_ids = []
+            self.current_ids = iter([
+                {"existing", "first-otp"},
+                {"existing", "first-otp", "second-otp"},
+            ])
+
+        def wait_for_code(self, account, **kwargs):
+            self.wait_before_ids.append(set(kwargs["before_ids"]))
+            return "111111" if len(self.wait_before_ids) == 1 else "222222"
+
+        def get_current_ids(self, account):
+            return next(self.current_ids)
+
+    mailbox = FakeMailbox()
+    ctx = SimpleNamespace(
+        platform=SimpleNamespace(mailbox=mailbox),
+        identity=SimpleNamespace(mailbox_account=object(), before_ids={"existing"}),
+        log=lambda message: None,
+    )
+    otp_callback = build_otp_callback(ctx)
+
+    assert otp_callback() == "111111"
+    assert otp_callback() == "222222"
+    assert mailbox.wait_before_ids == [
+        {"existing"},
+        {"existing", "first-otp"},
+    ]
+
+
+def test_browser_registration_existing_url_only_mailbox_switches_password_page_to_otp(monkeypatch):
+    class FakePage:
+        url = "https://auth.openai.com/log-in/password"
+
+        def evaluate(self, script):
+            return "Test User Agent"
+
+    page = FakePage()
+    events = []
+    states = iter([
+        {"page_type": "login_password", "current_url": page.url},
+        {"page_type": "oauth_callback", "current_url": "http://localhost/callback"},
+    ])
+
+    monkeypatch.setattr(browser_register_module, "_seed_browser_device_id", lambda *args: None)
+    monkeypatch.setattr(browser_register_module, "_start_browser_signup_via_page", lambda *args: next(states))
+    monkeypatch.setattr(browser_register_module, "_get_cookies", lambda page: {})
+    monkeypatch.setattr(browser_register_module, "_recover_signup_password_page", lambda *args: False)
+    monkeypatch.setattr(
+        browser_register_module,
+        "_submit_oauth_password_direct",
+        lambda *args: pytest.fail("generated registration password must not be submitted for an existing account"),
+    )
+
+    def switch_to_otp(page, log):
+        events.append("switch_otp")
+        page.url = "https://auth.openai.com/email-verification"
+        return True
+
+    monkeypatch.setattr(browser_register_module, "_switch_login_password_to_otp", switch_to_otp)
+    monkeypatch.setattr(browser_register_module, "_derive_registration_state_from_page", lambda page: next(states))
+    monkeypatch.setattr(browser_register_module, "_handle_post_signup_onboarding", lambda *args: None)
+    monkeypatch.setattr(
+        browser_register_module,
+        "_extract_flow_state",
+        lambda data, url: {"page_type": "oauth_callback", "current_url": url},
+    )
+
+    result = browser_register_module._browser_registration_flow(
+        page,
+        "user@icloud.com",
+        "GeneratedRegistrationPassword123!",
+        lambda: "654321",
+        None,
+        lambda message: None,
+    )
+
+    assert events == ["switch_otp"]
+    assert result["account_password"] == ""
+
+
+def test_browser_registration_uses_known_existing_login_password(monkeypatch):
+    class FakePage:
+        url = "https://auth.openai.com/log-in/password"
+
+        def evaluate(self, script):
+            return "Test User Agent"
+
+    page = FakePage()
+    submitted = []
+    states = iter([
+        {"page_type": "login_password", "current_url": page.url},
+        {"page_type": "oauth_callback", "current_url": "http://localhost/callback"},
+    ])
+    monkeypatch.setattr(browser_register_module, "_seed_browser_device_id", lambda *args: None)
+    monkeypatch.setattr(browser_register_module, "_start_browser_signup_via_page", lambda *args: next(states))
+    monkeypatch.setattr(browser_register_module, "_get_cookies", lambda page: {})
+    monkeypatch.setattr(browser_register_module, "_recover_signup_password_page", lambda *args: False)
+
+    def submit_password(page, password, log):
+        submitted.append(password)
+        page.url = "http://localhost/callback"
+        return {"ok": True, "status": 200, "url": page.url, "data": {"page": {"type": "oauth_callback"}}, "text": ""}
+
+    monkeypatch.setattr(browser_register_module, "_submit_oauth_password_direct", submit_password)
+    monkeypatch.setattr(browser_register_module, "_handle_post_signup_onboarding", lambda *args: None)
+    monkeypatch.setattr(
+        browser_register_module,
+        "_extract_flow_state",
+        lambda data, url: {"page_type": "oauth_callback", "current_url": url},
+    )
+
+    result = browser_register_module._browser_registration_flow(
+        page,
+        "user@icloud.com",
+        "GeneratedRegistrationPassword123!",
+        lambda: "654321",
+        None,
+        lambda message: None,
+        login_password="KnownChatGPTPassword123!",
+    )
+
+    assert submitted == ["KnownChatGPTPassword123!"]
+    assert result["account_password"] == "KnownChatGPTPassword123!"
+
+
+def test_browser_registration_preserves_created_password_when_phone_step_is_skipped(monkeypatch):
+    class FakePage:
+        url = "https://auth.openai.com/create-account/password"
+
+        def evaluate(self, script):
+            return "Test User Agent"
+
+    page = FakePage()
+    monkeypatch.setattr(browser_register_module, "_seed_browser_device_id", lambda *args: None)
+    monkeypatch.setattr(
+        browser_register_module,
+        "_start_browser_signup_via_page",
+        lambda *args: {"page_type": "create_account_password", "current_url": page.url},
+    )
+    monkeypatch.setattr(browser_register_module, "_get_cookies", lambda page: {})
+    monkeypatch.setattr(
+        browser_register_module,
+        "_submit_password_via_page",
+        lambda *args: {"ok": True, "status": 200, "url": "https://auth.openai.com/add-phone", "data": None, "text": ""},
+    )
+    monkeypatch.setattr(
+        browser_register_module,
+        "_extract_flow_state",
+        lambda data, url: {"page_type": "add_phone", "current_url": url},
+    )
+
+    result = browser_register_module._browser_registration_flow(
+        page,
+        "new-user@example.com",
+        "GeneratedRegistrationPassword123!",
+        lambda: "654321",
+        None,
+        lambda message: None,
+    )
+
+    assert result["account_password"] == "GeneratedRegistrationPassword123!"
+
+
+def test_known_chatgpt_login_password_ignores_url_only_mailbox_password():
+    def make_context(credentials, *, supplied=False, password="GeneratedRegistrationPassword123!"):
+        mailbox_account = SimpleNamespace(
+            extra={"provider_account": {"credentials": credentials}},
+        )
+        return SimpleNamespace(
+            identity=SimpleNamespace(mailbox_account=mailbox_account),
+            password_supplied=supplied,
+            password=password,
+        )
+
+    assert _known_chatgpt_login_password(make_context({"icloud_api_url": "https://mail.example/inbox"})) == ""
+    assert _known_chatgpt_login_password(make_context({
+        "login_mode": "password_or_email_otp",
+        "password": "KnownChatGPTPassword123!",
+    })) == "KnownChatGPTPassword123!"
+    assert _known_chatgpt_login_password(make_context({}, supplied=True)) == "GeneratedRegistrationPassword123!"
 
 
 def test_chatgpt_platform_preserves_user_supplied_password():

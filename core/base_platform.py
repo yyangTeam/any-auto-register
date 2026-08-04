@@ -133,6 +133,7 @@ class BasePlatform(ABC):
             email=email,
             password=resolved_password,
             log_fn=self.log,
+            password_supplied=bool(password),
         )
 
         if (self.config.executor_type or "") in ("headless", "headed"):
