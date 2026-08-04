@@ -87,9 +87,20 @@ SIGNUP_RECOVERY_SELECTORS = [
 PASSWORDLESS_LOGIN_SELECTORS = [
     'button[name="intent"][value="passwordless_login_send_otp"]',
     'button[value="passwordless_login_send_otp"]',
+    'button[name="intent"][value*="otp" i]',
+    'button[data-testid*="otp" i]',
+    'button[aria-label*="one-time" i]',
     'button:has-text("one-time code")',
     'button:has-text("one time code")',
+    'button:has-text("email code")',
+    'button:has-text("login code")',
+    'button:has-text("Email me a code")',
     'button:has-text("passwordless")',
+    'a:has-text("one-time code")',
+    'a:has-text("one time code")',
+    'a:has-text("email code")',
+    'a:has-text("login code")',
+    'a[href*="email-otp" i]',
     'button:has-text("一次性验证码")',
     'button:has-text("一次性代码")',
     'button:has-text("一次性代碼")',
@@ -918,6 +929,11 @@ def _has_signup_registration_choice(page) -> bool:
 
 
 def _click_passwordless_login_if_available(page, log, *, context: str) -> bool:
+    current_url = str(page.url or "").lower()
+    if "email-verification" in current_url or "email-otp" in current_url:
+        return False
+    if _find_first_selector(page, OTP_INPUT_SELECTORS):
+        return False
     selector = _click_first(page, PASSWORDLESS_LOGIN_SELECTORS, timeout=1)
     if selector:
         log(f"{context} 已选择一次性验证码登录: {selector}")
@@ -928,15 +944,22 @@ def _click_passwordless_login_if_available(page, log, *, context: str) -> bool:
             page.evaluate(
                 """
                 () => {
-                  const nodes = Array.from(document.querySelectorAll('button, [role="button"], a'));
+                  const nodes = Array.from(document.querySelectorAll('button, [role="button"], a, input[type="submit"]'));
                   const visible = (el) => {
                     const style = window.getComputedStyle(el);
                     const rect = el.getBoundingClientRect();
-                    return style && style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                    return style && !el.disabled && style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
                   };
                   const target = nodes.find((el) => {
-                    const text = String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
-                    return visible(el) && /使用一次性(?:验证码|驗證碼|代码|代碼)登录|使用一次性(?:驗證碼|代碼)登入|one-time code|one time code|passwordless/i.test(text);
+                    const fingerprint = [
+                      el.innerText, el.textContent, el.value, el.name,
+                      el.getAttribute('aria-label'), el.getAttribute('title'),
+                      el.getAttribute('data-testid'), el.getAttribute('href'),
+                      el.getAttribute('formaction'), el.form?.getAttribute('action')
+                    ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                    const textHint = /使用一次性(?:验证码|驗證碼|代码|代碼)登录|使用一次性(?:驗證碼|代碼)登入|(?:log[ -]?in|sign[ -]?in|continue|email(?: me)?|send|get|request|use)[^\\n]{0,45}(?:one[ -]?time|email|login)?[ -]?(?:code|otp)|(?:one[ -]?time|email|login)[ -]?(?:code|otp)|passwordless/i;
+                    const machineHint = /passwordless|email[-_/]?otp|send[-_]?otp|otp[-_]?send/i;
+                    return visible(el) && (textHint.test(fingerprint) || machineHint.test(fingerprint));
                   });
                   if (!target) return false;
                   target.click();
@@ -953,6 +976,73 @@ def _click_passwordless_login_if_available(page, log, *, context: str) -> bool:
     return clicked
 
 
+def _passwordless_control_summary(page) -> str:
+    try:
+        controls = page.evaluate(
+            """
+            () => Array.from(document.querySelectorAll('button, [role="button"], a, input[type="submit"]'))
+              .filter((el) => {
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style && style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+              })
+              .slice(0, 12)
+              .map((el) => ({
+                tag: el.tagName.toLowerCase(),
+                text: String(el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim().slice(0, 80),
+                name: String(el.name || '').slice(0, 50),
+                value: String(el.value || '').slice(0, 80),
+                testid: String(el.getAttribute('data-testid') || '').slice(0, 80),
+              }))
+            """
+        ) or []
+    except Exception:
+        return "unavailable"
+    items = []
+    for item in controls:
+        if not isinstance(item, dict):
+            continue
+        fields = [str(item.get(key) or "").strip() for key in ("text", "name", "value", "testid")]
+        detail = "|".join(value for value in fields if value)
+        items.append(f"{item.get('tag') or '?'}:{detail[:160] or '-'}")
+    return "; ".join(items[:12]) or "none"
+
+
+def _send_login_email_otp_direct(page, log) -> bool:
+    """Use the authenticated password-page session when the OTP control is hidden."""
+    current_url = str(page.url or f"{OPENAI_AUTH}/log-in/password")
+    response = _send_browser_email_otp(page, referer=current_url)
+    status = int(response.get("status") or 0)
+    headers = dict(response.get("headers") or {})
+    content_type = str(headers.get("content-type") or "").lower()
+    location = str(headers.get("location") or "").strip()
+    is_json = not content_type or "json" in content_type
+    confirmed = bool(response.get("ok")) and status in {200, 201, 204} and not location and (status == 204 or is_json)
+    log(
+        "OAuth 密码验证页直接发送邮箱验证码: "
+        f"status={status} content_type={content_type or '-'} location={location[:100] or '-'}"
+    )
+    if not confirmed:
+        return False
+
+    state = _extract_flow_state(response.get("data"), "")
+    target_url = _normalize_url(str(state.get("continue_url") or ""), OPENAI_AUTH)
+    if not target_url or "email-otp/send" in target_url:
+        target_url = f"{OPENAI_AUTH}/email-verification"
+    try:
+        page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+    except Exception as exc:
+        log(f"邮箱验证码已发送，但验证码页跳转异常: {exc}")
+
+    transition_deadline = time.time() + 10
+    while time.time() < transition_deadline:
+        if _is_email_otp(_derive_registration_state_from_page(page)):
+            log("OAuth 密码验证页已通过接口切换到邮箱验证码登录")
+            return True
+        time.sleep(0.25)
+    return False
+
+
 def _switch_login_password_to_otp(page, log, *, timeout: float = 8) -> bool:
     """Switch a login password challenge to the email OTP flow."""
     deadline = time.time() + timeout
@@ -967,6 +1057,12 @@ def _switch_login_password_to_otp(page, log, *, timeout: float = 8) -> bool:
             # The click sends the OTP even if the page transition is unusually slow.
             return True
         time.sleep(0.25)
+    try:
+        if _send_login_email_otp_direct(page, log):
+            return True
+    except Exception as exc:
+        log(f"OAuth 密码验证页直接发送邮箱验证码失败: {exc}")
+    log(f"OAuth 密码验证页可见控件: {_passwordless_control_summary(page)}")
     return False
 
 
@@ -1759,7 +1855,7 @@ def _submit_browser_user_register(page, email: str, password: str, device_id: st
     )
 
 
-def _send_browser_email_otp(page) -> dict:
+def _send_browser_email_otp(page, *, referer: str = "") -> dict:
     _browser_pause(page)
     return _browser_fetch(
         page,
@@ -1767,13 +1863,13 @@ def _send_browser_email_otp(page) -> dict:
         method="GET",
         headers={
             "accept": "application/json, text/plain, */*",
-            "referer": f"{OPENAI_AUTH}/create-account/password",
+            "referer": referer or f"{OPENAI_AUTH}/create-account/password",
             "sec-fetch-site": "same-origin",
             "sec-fetch-mode": "cors",
             "sec-fetch-dest": "empty",
             "accept-language": "en-US,en;q=0.9",
         },
-        redirect="follow",
+        redirect="manual",
     )
 
 

@@ -273,6 +273,86 @@ def test_browser_registration_existing_url_only_mailbox_switches_password_page_t
     assert result["account_password"] == ""
 
 
+def test_switch_login_password_to_otp_uses_direct_send_when_control_is_hidden(monkeypatch):
+    class FakePage:
+        url = "https://auth.openai.com/log-in/password"
+
+        def goto(self, url, **kwargs):
+            self.url = url
+
+    page = FakePage()
+    captured = {}
+    logs = []
+    monkeypatch.setattr(browser_register_module, "_click_passwordless_login_if_available", lambda *args, **kwargs: False)
+
+    def send_otp(page, *, referer=""):
+        captured["referer"] = referer
+        return {
+            "ok": True,
+            "status": 200,
+            "headers": {"content-type": "application/json"},
+            "data": {"page": {"type": "email_otp_verification"}},
+        }
+
+    monkeypatch.setattr(browser_register_module, "_send_browser_email_otp", send_otp)
+    monkeypatch.setattr(
+        browser_register_module,
+        "_derive_registration_state_from_page",
+        lambda page: {"page_type": "email_otp_verification", "current_url": page.url},
+    )
+
+    assert browser_register_module._switch_login_password_to_otp(
+        page,
+        logs.append,
+        timeout=0,
+    ) is True
+    assert captured["referer"] == "https://auth.openai.com/log-in/password"
+    assert page.url == "https://auth.openai.com/email-verification"
+    assert any("通过接口切换" in message for message in logs)
+
+
+def test_switch_login_password_to_otp_rejects_html_fallback_response(monkeypatch):
+    class FakePage:
+        url = "https://auth.openai.com/log-in/password"
+
+    logs = []
+    monkeypatch.setattr(browser_register_module, "_click_passwordless_login_if_available", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        browser_register_module,
+        "_send_browser_email_otp",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "status": 200,
+            "headers": {"content-type": "text/html"},
+            "data": None,
+        },
+    )
+    monkeypatch.setattr(browser_register_module, "_passwordless_control_summary", lambda page: "button:Continue")
+
+    assert browser_register_module._switch_login_password_to_otp(
+        FakePage(),
+        logs.append,
+        timeout=0,
+    ) is False
+    assert any("content_type=text/html" in message for message in logs)
+    assert any("button:Continue" in message for message in logs)
+
+
+def test_passwordless_login_click_is_skipped_on_email_otp_page(monkeypatch):
+    page = SimpleNamespace(url="https://auth.openai.com/email-verification")
+    monkeypatch.setattr(
+        browser_register_module,
+        "_click_first",
+        lambda *args, **kwargs: pytest.fail("OTP page must not be treated as a passwordless-login choice"),
+    )
+
+    assert browser_register_module._click_passwordless_login_if_available(
+        page,
+        lambda message: None,
+        context="test",
+    ) is False
+
+
 def test_browser_registration_uses_known_existing_login_password(monkeypatch):
     class FakePage:
         url = "https://auth.openai.com/log-in/password"
