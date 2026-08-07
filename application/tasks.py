@@ -119,7 +119,6 @@ _NOISY_TASK_LOG_MARKERS = (
     "redirect_uri",
     "callback_url",
     "提交注册表单状态",
-    "HTTP ",
     "浏览器当前 URL",
     "等待页面",
     "已填写",
@@ -300,8 +299,24 @@ def create_task(
 
 def create_register_task(payload: dict[str, Any]) -> dict[str, Any]:
     payload = dict(payload or {})
+    extra = dict(payload.get("extra") or {})
+    # Failed mailbox rows are retained for a deliberate, address-specific retry.
+    # New registration tasks must only consume freshly imported mailbox rows.
+    extra["local_mail_pool_include_retry_rows"] = False
+    payload["extra"] = extra
+    platform = str(payload.get("platform") or "").strip().lower()
+    if platform == "chatgpt":
+        _preflight_chatgpt_register_task(payload, extra)
+        requested_concurrency = max(_int_config(payload.get("concurrency"), 1), 1)
+        max_concurrency = _registration_policy_int(
+            extra,
+            "chatgpt_register_max_concurrency",
+            5,
+            minimum=1,
+            maximum=5,
+        )
+        payload["concurrency"] = min(requested_concurrency, max_concurrency)
     if _bool_config(payload.get("run_all_mailboxes"), False):
-        extra = dict(payload.get("extra") or {})
         from core.base_identity import normalize_identity_provider
         from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
         from infrastructure.provider_settings_repository import ProviderSettingsRepository
@@ -321,7 +336,16 @@ def create_register_task(payload: dict[str, Any]) -> dict[str, Any]:
         if available_count <= 0:
             raise RuntimeError("本地邮箱池当前没有可用邮箱")
         payload["count"] = available_count
-        payload["concurrency"] = 5
+        if platform == "chatgpt":
+            payload["concurrency"] = _registration_policy_int(
+                extra,
+                "chatgpt_register_max_concurrency",
+                5,
+                minimum=1,
+                maximum=5,
+            )
+        else:
+            payload["concurrency"] = 5
         extra["local_mail_pool_avoid_repeat"] = True
         payload["extra"] = extra
 
@@ -456,7 +480,9 @@ def reconcile_local_mailbox_reservations() -> list[str]:
         definition = ProviderDefinitionsRepository().get_by_key("mailbox", provider_key) if provider_key else None
         if not definition or definition.driver_type not in {"local_ms_pool", "local_mail_pool"}:
             return []
-        settings = settings_repo.resolve_runtime_settings("mailbox", provider_key, {})
+        settings = settings_repo.resolve_runtime_settings(
+            "mailbox", provider_key, {"local_mail_pool_include_retry_rows": True}
+        )
         pool = LocalMicrosoftMailboxPool.from_config(settings)
         with Session(engine) as session:
             saved_emails = set(session.exec(select(AccountModel.email)).all())
@@ -821,6 +847,160 @@ def _int_config(value: Any, default: int) -> int:
         return default
 
 
+def _registration_policy_int(
+    extra: dict[str, Any],
+    key: str,
+    default: int,
+    *,
+    minimum: int = 0,
+    maximum: int = 3600,
+) -> int:
+    raw_value = extra.get(key)
+    if raw_value in (None, ""):
+        try:
+            from core.config_store import config_store
+
+            raw_value = config_store.get(key, "")
+        except Exception:
+            raw_value = ""
+    return min(max(_int_config(raw_value, default), minimum), maximum)
+
+
+def _is_rate_limit_failure(error: str) -> bool:
+    text = str(error or "").lower()
+    return any(marker in text for marker in ("http 429", "rate_limit_exceeded", "too many requests"))
+
+
+def _classify_registration_failure(error: str) -> str:
+    text = str(error or "")
+    lowered = text.lower()
+    if _is_rate_limit_failure(text):
+        return "openai_rate_limited"
+    if "invalid_state" in lowered or "sign-in session is no longer valid" in lowered or "登录会话已失效" in text:
+        return "oauth_invalid_state"
+    if "incorrect email address or password" in lowered:
+        return "login_password_rejected"
+    if "不支持邮箱一次性验证码登录" in text or "必须提供正确的 openai 登录密码" in lowered:
+        return "login_password_required"
+    if "add_phone" in lowered or "手机验证" in text or "短信验证" in text:
+        return "phone_verification_failed"
+    if "callback" in lowered or "consent" in lowered or "workspace" in lowered:
+        return "oauth_callback_incomplete"
+    if "otp" in lowered or "验证码" in text:
+        return "email_otp_failed"
+    if "不在本地邮箱池" in text or "格式不可用" in text:
+        return "mailbox_unavailable"
+    return "registration_failed"
+
+
+def _registration_failure_reason(error: str, failure_kind: str) -> str:
+    text = str(error or "").strip()
+    if failure_kind == "oauth_callback_incomplete":
+        return text or "Codex 授权页未生成 workspace/consent callback"
+    if failure_kind == "oauth_invalid_state":
+        return text or "OpenAI OAuth state 已失效"
+    if failure_kind == "openai_rate_limited":
+        return text or "OpenAI 返回 429 Too many requests"
+    if failure_kind == "email_otp_failed":
+        return text or "邮箱验证码发送、读取或校验失败"
+    if failure_kind == "login_password_required":
+        return text or "该 OpenAI 账号不支持邮箱一次性验证码登录，必须提供正确密码"
+    if failure_kind == "phone_verification_failed":
+        return text or "手机号租用、短信读取或校验失败"
+    return text or "注册流程发生未分类错误"
+
+
+def _recent_chatgpt_rate_limit_remaining(cooldown_seconds: int) -> int:
+    if cooldown_seconds <= 0:
+        return 0
+    with Session(engine) as session:
+        logs = session.exec(
+            select(TaskLog)
+            .where(TaskLog.platform == "chatgpt")
+            .where(TaskLog.status == "failed")
+            .order_by(TaskLog.created_at.desc())
+            .limit(100)
+        ).all()
+    now = _utcnow()
+    for log in logs:
+        if not _is_rate_limit_failure(str(log.error or "")):
+            continue
+        created_at = log.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        remaining = cooldown_seconds - int((now - created_at).total_seconds())
+        return max(remaining, 0)
+    return 0
+
+
+def _preflight_chatgpt_register_task(payload: dict[str, Any], extra: dict[str, Any]) -> None:
+    cooldown_seconds = _registration_policy_int(
+        extra,
+        "chatgpt_rate_limit_cooldown_seconds",
+        0,
+        minimum=0,
+        maximum=7200,
+    )
+    remaining = _recent_chatgpt_rate_limit_remaining(cooldown_seconds)
+    if remaining > 0:
+        raise RuntimeError(f"OpenAI 429 冷却中，请 {remaining} 秒后再创建 ChatGPT 注册任务")
+
+    email = str(payload.get("email") or "").strip().lower()
+    if not email:
+        return
+
+    with Session(engine) as session:
+        existing = session.exec(
+            select(AccountModel).where(func.lower(AccountModel.email) == email)
+        ).first()
+        if existing:
+            raise RuntimeError(f"邮箱已注册并存在于账号记录中: {email}")
+        active_tasks = session.exec(
+            select(TaskModel)
+            .where(TaskModel.type == TASK_TYPE_REGISTER)
+            .where(TaskModel.platform == "chatgpt")
+            .where(TaskModel.status.in_([TASK_STATUS_PENDING] + list(ACTIVE_TASK_STATUSES)))
+        ).all()
+        for task in active_tasks:
+            task_email = str(task.get_payload().get("email") or "").strip().lower()
+            if task_email == email:
+                raise RuntimeError(f"该邮箱已有待执行或进行中的注册任务: {email}")
+
+    from core.base_identity import normalize_identity_provider
+    from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
+    from infrastructure.provider_settings_repository import ProviderSettingsRepository
+
+    if normalize_identity_provider(extra.get("identity_provider", "mailbox")) != "mailbox":
+        return
+    settings_repo = ProviderSettingsRepository()
+    provider_key = str(extra.get("mail_provider") or settings_repo.get_default_provider_key("mailbox") or "").strip()
+    definition = ProviderDefinitionsRepository().get_by_key("mailbox", provider_key) if provider_key else None
+    if not definition or definition.driver_type not in {"local_ms_pool", "local_mail_pool"}:
+        return
+    from core.local_ms_mailbox import LocalMicrosoftMailboxPool
+
+    settings = settings_repo.resolve_runtime_settings(
+        "mailbox",
+        provider_key,
+        {**extra, "local_mail_pool_include_retry_rows": True},
+    )
+    LocalMicrosoftMailboxPool.from_config(settings).validate_email_address(email)
+
+
+def _register_attempt_budget(
+    *,
+    count: int,
+    exhaustive_mailbox_run: bool,
+    herosms_enabled: bool,
+    max_success: int,
+    sms_settings: dict[str, Any],
+) -> int:
+    if exhaustive_mailbox_run or not herosms_enabled:
+        return max(count, 1)
+    multiplier = max(_int_config(sms_settings.get("register_account_max_attempts"), 1), 1)
+    return max(max_success * multiplier, 1)
+
+
 def _auto_followup_windsurf_payment(
     *,
     platform_name: str,
@@ -931,7 +1111,6 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     from core.proxy_pool import proxy_pool
 
     count = max(int(payload.get("count", 1) or 1), 1)
-    concurrency = min(max(int(payload.get("concurrency", 1) or 1), 1), count, 3)
     platform_name = str(payload.get("platform", ""))
     email = payload.get("email") or None
     password = payload.get("password") or None
@@ -940,11 +1119,36 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         from core.http_client import resolve_proxy_url
         proxy = resolve_proxy_url(None)
     extra = dict(payload.get("extra") or {})
+    requested_concurrency = min(max(int(payload.get("concurrency", 1) or 1), 1), count, 5)
+    if platform_name == "chatgpt":
+        max_concurrency = _registration_policy_int(
+            extra,
+            "chatgpt_register_max_concurrency",
+            5,
+            minimum=1,
+            maximum=5,
+        )
+        concurrency = min(requested_concurrency, max_concurrency)
+        registration_interval = _registration_policy_int(
+            extra,
+            "chatgpt_register_interval_seconds",
+            0,
+            minimum=0,
+            maximum=300,
+        )
+        logger.log(
+            f"ChatGPT 稳定性策略: 任务并发 {concurrency}，账号间隔 {registration_interval} 秒",
+            event_type="summary",
+        )
+    else:
+        concurrency = min(requested_concurrency, count, 5)
+        registration_interval = 0
     if _bool_config(payload.get("run_all_mailboxes"), False):
         logger.log(f"跑完所有邮箱: 本次共 {count} 个，并发 {concurrency}", event_type="summary")
     sms_provider_key, sms_settings = _resolve_sms_provider_for_task(extra)
     herosms_enabled = sms_provider_key in {"herosms", "herosms_api"} and bool(str(sms_settings.get("herosms_api_key") or "").strip())
     hero_extra_max = max(_int_config(sms_settings.get("register_phone_extra_max"), 3), 0) if herosms_enabled else 0
+    hero_attempt_multiplier = max(_int_config(sms_settings.get("register_account_max_attempts"), 1), 1) if herosms_enabled else 1
     hero_reuse_to_max = False
     target_success = count
     max_success = count + hero_extra_max if herosms_enabled and hero_reuse_to_max else count
@@ -953,7 +1157,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     logger.set_progress(0, progress_total)
     if herosms_enabled:
         logger.log(
-            f"HeroSMS 模式: 成功目标 {target_success}，失败自动补尝试；手机号不复用"
+            f"HeroSMS 模式: 成功目标 {target_success}，每个目标最多尝试 {hero_attempt_multiplier} 次；手机号不复用"
         )
 
     try:
@@ -1052,19 +1256,30 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 _release_failed_mailbox_reservation(platform, logger)
                 return "__cancel_requested__"
             error = str(exc)
+            failure_kind = _classify_registration_failure(error)
+            failure_reason = _registration_failure_reason(error, failure_kind)
             failed_email = _registration_email(platform, email or "")
             failed_source_row = _registration_source_row(platform, failed_email)
             _release_failed_mailbox_reservation(platform, logger, error)
             logger.record_error(error)
+            logger.log(f"失败分类: {failure_kind}；实际原因: {failure_reason}", level="warning")
             logger.log(f"✗ 注册失败: {error}", level="error")
             if failed_email:
                 with failed_mailboxes_lock:
                     failed_mailboxes[failed_email.lower()] = {
                         "email": failed_email,
                         "error": error,
+                        "failure_kind": failure_kind,
+                        "failure_reason": failure_reason,
                         "source_row": failed_source_row,
                     }
-            _save_task_log(platform_name, failed_email, "failed", error=error)
+            _save_task_log(
+                platform_name,
+                failed_email,
+                "failed",
+                error=error,
+                detail={"failure_kind": failure_kind, "failure_reason": failure_reason},
+            )
             return error
 
     try:
@@ -1072,7 +1287,13 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         completed = 0
         futures: dict[Any, int] = {}
         exhaustive_mailbox_run = _bool_config(payload.get("run_all_mailboxes"), False)
-        max_attempts = max(count if exhaustive_mailbox_run or not herosms_enabled else max_success * 3, 1)
+        max_attempts = _register_attempt_budget(
+            count=count,
+            exhaustive_mailbox_run=exhaustive_mailbox_run,
+            herosms_enabled=herosms_enabled,
+            max_success=max_success,
+            sms_settings=sms_settings,
+        )
 
         def _hero_phone_alive() -> bool:
             if not (herosms_enabled and hero_reuse_to_max):
@@ -1106,6 +1327,18 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
 
         pool = ThreadPoolExecutor(max_workers=concurrency)
         cancelled = False
+
+        def _wait_between_accounts() -> bool:
+            if platform_name != "chatgpt" or registration_interval <= 0:
+                return True
+            logger.log(f"等待 {registration_interval} 秒后继续下一个 ChatGPT 邮箱")
+            deadline = time.monotonic() + registration_interval
+            while time.monotonic() < deadline:
+                if logger.is_cancel_requested():
+                    return False
+                time.sleep(min(0.5, max(deadline - time.monotonic(), 0)))
+            return True
+
         try:
             while _should_submit_more() and len(futures) < concurrency:
                 futures[pool.submit(_do_one, submitted)] = submitted
@@ -1132,6 +1365,9 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                     elif result != "__cancel_requested__":
                         errors.append(str(result))
                     logger.set_progress(min(success if herosms_enabled else completed, progress_total), progress_total)
+                if _should_submit_more() and len(futures) < concurrency and not _wait_between_accounts():
+                    cancelled = True
+                    break
                 while _should_submit_more() and len(futures) < concurrency:
                     futures[pool.submit(_do_one, submitted)] = submitted
                     submitted += 1
@@ -1162,7 +1398,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     logger.set_result_data(result_data)
     if failed_items:
         logger.log(
-            f"失败邮箱统计: 去重后 {len(failed_items)} 个，已释放占用，将在下一批继续尝试",
+            f"失败邮箱统计: 去重后 {len(failed_items)} 个，已释放占用，已保留至累计邮箱池等待手动重试",
             event_type="summary",
         )
     summary = f"完成: 成功 {success} 个, 失败 {len(errors)} 个"

@@ -114,20 +114,26 @@ class Sub2ApiClient:
             return None, f"导入成功但未查到账号 {account_name}"
         return max(matches), ""
 
-    def _bind_group(self, account_id: int, group_id: int, group_name: str) -> tuple[bool, str]:
+    def _bind_groups(
+        self,
+        account_id: int,
+        group_ids: list[int],
+        group_names: list[str],
+    ) -> tuple[bool, str]:
+        group_label = ", ".join(group_names)
         try:
             response = requests.put(
                 f"{self.api_base}/admin/accounts/{account_id}",
                 headers=self._headers,
-                json={"group_ids": [group_id]},
+                json={"group_ids": group_ids},
                 timeout=self.timeout,
             )
         except Exception as exc:
-            return False, f"绑定分组 {group_name} 异常: {exc}"
+            return False, f"绑定分组 {group_label} 异常: {exc}"
 
         payload = self._payload(response)
         if response.status_code != 200 or payload.get("code") not in (None, 0):
-            return False, f"绑定分组 {group_name} 失败: {self._response_error(response, payload)}"
+            return False, f"绑定分组 {group_label} 失败: {self._response_error(response, payload)}"
         return True, ""
 
     def import_data(
@@ -135,15 +141,27 @@ class Sub2ApiClient:
         data: dict[str, Any],
         *,
         group_name: str = DEFAULT_SUB2API_GROUP,
+        group_names: list[str] | None = None,
     ) -> tuple[bool, str]:
         if not self.api_base or self.api_base == "/api/v1":
             return False, "Sub2API URL 未配置"
         if not self.api_key:
             return False, "Sub2API 管理密钥未配置"
 
-        group_id, error = self._resolve_group_id(group_name)
-        if group_id is None:
-            return False, error
+        targets: list[str] = []
+        for candidate in group_names or [group_name]:
+            normalized = str(candidate or "").strip()
+            if normalized and normalized.casefold() not in {item.casefold() for item in targets}:
+                targets.append(normalized)
+        if not targets:
+            targets = [DEFAULT_SUB2API_GROUP]
+
+        group_ids: list[int] = []
+        for target in targets:
+            group_id, error = self._resolve_group_id(target)
+            if group_id is None:
+                return False, error
+            group_ids.append(group_id)
 
         try:
             response = requests.post(
@@ -176,10 +194,10 @@ class Sub2ApiClient:
         account_id, error = self._find_account_id(account_name)
         if account_id is None:
             return False, error
-        bound, error = self._bind_group(account_id, group_id, group_name)
+        bound, error = self._bind_groups(account_id, group_ids, targets)
         if not bound:
             return False, error
-        return True, f"同步成功（新增 {created}，已绑定分组 {group_name}）"
+        return True, f"同步成功（新增 {created}，已绑定分组 {', '.join(targets)}）"
 
 
 def _get_sub2api_config() -> tuple[bool, str, str]:
@@ -199,6 +217,42 @@ def _get_sub2api_config() -> tuple[bool, str, str]:
         return enabled, base_url, api_key
     except Exception:
         return False, "", ""
+
+
+def _get_sub2api_group_config() -> dict[str, str]:
+    try:
+        from core.config_store import config_store
+
+        configured = config_store.get_all()
+        return {
+            # Preserve the historical free-only route until the user saves the
+            # new fields. Once a field exists, an empty value intentionally
+            # disables that target group.
+            "free": str(configured.get("sub2api_free_group", DEFAULT_SUB2API_GROUP) or "").strip(),
+            "pro": str(configured.get("sub2api_pro_group", "") or "").strip(),
+            "integration": str(configured.get("sub2api_integration_group", "") or "").strip(),
+            "mixed": str(configured.get("sub2api_mixed_group", "") or "").strip(),
+        }
+    except Exception:
+        return {"free": DEFAULT_SUB2API_GROUP, "pro": "", "integration": "", "mixed": ""}
+
+
+def _target_group_names(_account: Any) -> list[str]:
+    config = _get_sub2api_group_config()
+    # Every successful registration goes to every configured target. These are
+    # distribution groups, not account-plan classifications.
+    candidates = [
+        config.get("free", ""),
+        config.get("pro", ""),
+        config.get("integration", ""),
+        config.get("mixed", ""),
+    ]
+    result: list[str] = []
+    for candidate in candidates:
+        normalized = str(candidate or "").strip()
+        if normalized and normalized.casefold() not in {item.casefold() for item in result}:
+            result.append(normalized)
+    return result
 
 
 def push_saved_account_to_sub2api(
@@ -242,11 +296,15 @@ def push_saved_account_to_sub2api(
         emit("  [Sub2API] 缺少 access_token 或 refresh_token，已跳过", level="warning")
         return False
 
+    target_groups = _target_group_names(account)
+    if not target_groups:
+        emit("  [Sub2API] 未配置上传目标分组，已跳过", level="warning")
+        return False
     emit(
         f"  [Sub2API] 开始上传: {account.email} -> {base_url.rstrip('/')}，"
-        f"目标分组: {DEFAULT_SUB2API_GROUP}"
+        f"目标分组: {', '.join(target_groups)}"
     )
-    ok, message = Sub2ApiClient(base_url, api_key).import_data(data)
+    ok, message = Sub2ApiClient(base_url, api_key).import_data(data, group_names=target_groups)
     if ok:
         emit(f"  [Sub2API] ✓ {account.email} {message}")
     else:

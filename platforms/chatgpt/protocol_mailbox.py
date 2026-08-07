@@ -95,8 +95,11 @@ class ChatGPTProtocolMailboxWorker:
         totp_secret = str(credentials.get("totp_secret") or "").strip()
         totp_url = str(credentials.get("totp_url") or "").strip()
         login_mode = str(credentials.get("login_mode") or "").strip()
+        inbox_url = str(credentials.get("icloud_api_url") or "").strip()
         return bool(
-            (password and (totp_secret or totp_url))
+            login_mode == "email_otp_only"
+            or (inbox_url and not password)
+            or (password and (totp_secret or totp_url))
             or (password and login_mode == "password_or_email_otp")
         )
 
@@ -110,8 +113,9 @@ class ChatGPTProtocolMailboxWorker:
         self.engine.totp_secret = credential_totp_secret
         self.engine.totp_url = credential_totp_url
 
-        # 按每条邮箱的凭据能力选择分支：纯接码邮箱注册新号，密码/MFA 或
-        # 密码+接码 URL 的已有账号走 Codex 登录，页面需要邮件码时再读取 URL。
+        # 收码 URL、密码/MFA 和密码+收码 URL 都从第一步进入 Codex OAuth。
+        # Codex 对真新邮箱会返回 create_account_password，仍可在同一流程注册；
+        # 已注册邮箱则只完成 Codex 自己的一次邮箱验证。
         success = False
         try:
             if self._uses_existing_account_login(credentials):

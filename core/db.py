@@ -520,6 +520,17 @@ _LEGACY_PROVIDER_KEY_MAP: dict[tuple[str, str], str] = {
     ("captcha", "twocaptcha"): "twocaptcha_api",
 }
 
+
+def normalize_provider_key(provider_type: str, provider_key: str) -> str:
+    """Map legacy provider keys to the current built-in definition key."""
+    normalized_type = str(provider_type or "").strip()
+    normalized_key = str(provider_key or "").strip()
+    return _LEGACY_PROVIDER_KEY_MAP.get(
+        (normalized_type, normalized_key),
+        normalized_key,
+    )
+
+
 # 旧版 auth_mode 值 → 新版 auth_mode 值映射
 _LEGACY_AUTH_MODE_MAP: dict[str, str] = {
     "endpoint_only": "password",

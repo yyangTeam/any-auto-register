@@ -242,6 +242,7 @@ def _create_local_mail_pool(extra: dict, proxy: str | None) -> 'BaseMailbox':
             if "local_mail_pool_allow_reuse" in extra
             else extra.get("local_ms_pool_allow_reuse", "")
         ).strip().lower() in {"1", "true", "yes", "on"},
+        include_retry_rows=str(extra.get("local_mail_pool_include_retry_rows", "")).strip().lower() in {"1", "true", "yes", "on"},
         proxy=proxy,
     )
 

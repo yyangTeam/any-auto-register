@@ -32,6 +32,10 @@ const DEFAULT_FORM: Record<string, any> = {
   sub2api_enabled: false,
   sub2api_url: '',
   sub2api_api_key: '',
+  sub2api_free_group: 'free',
+  sub2api_pro_group: '',
+  sub2api_integration_group: '',
+  sub2api_mixed_group: '',
 }
 
 function configBoolean(value: unknown, fallback = false) {
@@ -139,6 +143,10 @@ export default function Register() {
           sub2api_enabled: configBoolean(cfg.sub2api_enabled, Boolean(cfg.sub2api_url && cfg.sub2api_api_key)),
           sub2api_url: cfg.sub2api_url || '',
           sub2api_api_key: cfg.sub2api_api_key || '',
+          sub2api_free_group: cfg.sub2api_free_group === undefined ? 'free' : cfg.sub2api_free_group,
+          sub2api_pro_group: cfg.sub2api_pro_group || '',
+          sub2api_integration_group: cfg.sub2api_integration_group || '',
+          sub2api_mixed_group: cfg.sub2api_mixed_group || '',
         }
         const providerFieldKeys = listProviderFieldKeys([
           ...((options?.mailbox_providers as ProviderOption[]) || []),
@@ -325,6 +333,10 @@ export default function Register() {
             sub2api_enabled: form.sub2api_enabled ? 'true' : 'false',
             sub2api_url: String(form.sub2api_url || '').trim(),
             sub2api_api_key: String(form.sub2api_api_key || '').trim(),
+            sub2api_free_group: String(form.sub2api_free_group || '').trim(),
+            sub2api_pro_group: String(form.sub2api_pro_group || '').trim(),
+            sub2api_integration_group: String(form.sub2api_integration_group || '').trim(),
+            sub2api_mixed_group: String(form.sub2api_mixed_group || '').trim(),
           },
         }),
       })
@@ -738,6 +750,10 @@ export default function Register() {
               <div className="grid gap-4 md:grid-cols-2">
                 <Input label="Sub2API 地址" k="sub2api_url" placeholder="https://sub.example.com" />
                 <Input label="Admin API Key" k="sub2api_api_key" type="password" placeholder="admin-..." />
+                <Input label="默认上传：Free" k="sub2api_free_group" placeholder="free" />
+                <Input label="默认上传：Pro" k="sub2api_pro_group" placeholder="pro" />
+                <Input label="默认上传：对接" k="sub2api_integration_group" placeholder="对接分组" />
+                <Input label="默认上传：混合" k="sub2api_mixed_group" placeholder="混合号池" />
               </div>
               <div className="flex flex-wrap items-center gap-3">
                 <Button type="button" variant="outline" onClick={saveSub2ApiConfig} disabled={sub2apiSaveState === 'saving'}>

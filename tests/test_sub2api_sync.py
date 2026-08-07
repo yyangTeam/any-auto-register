@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
-from application.sub2api_sync import Sub2ApiClient, push_saved_account_to_sub2api
+from application.sub2api_sync import Sub2ApiClient, _target_group_names, push_saved_account_to_sub2api
 from application.tasks import _auto_push_sub2api
 from domain.accounts import AccountRecord
 
@@ -89,6 +89,63 @@ def test_client_reports_api_failure():
     assert message == "查询目标分组失败: bad key"
 
 
+def test_client_imports_once_and_binds_multiple_groups():
+    free_group = _response(200, {"code": 0, "data": [{"id": 5, "name": "free"}]})
+    mixed_group = _response(200, {"code": 0, "data": [{"id": 8, "name": "混合号池"}]})
+    import_response = _response(200, {
+        "code": 0,
+        "data": {"account_created": 1, "account_failed": 0},
+    })
+    account_response = _response(200, {
+        "code": 0,
+        "data": {"items": [{"id": 17, "name": "user@example.com"}]},
+    })
+    bind_response = _response(200, {"code": 0, "data": {"id": 17}})
+    data = {"accounts": [{"name": "user@example.com"}]}
+
+    with (
+        patch(
+            "application.sub2api_sync.requests.get",
+            side_effect=[free_group, mixed_group, account_response],
+        ),
+        patch("application.sub2api_sync.requests.post", return_value=import_response) as post,
+        patch("application.sub2api_sync.requests.put", return_value=bind_response) as put,
+    ):
+        ok, message = Sub2ApiClient("https://sub.example.com", "admin-key").import_data(
+            data,
+            group_names=["free", "混合号池"],
+        )
+
+    assert ok is True
+    assert "已绑定分组 free, 混合号池" in message
+    assert post.call_count == 1
+    assert put.call_args.kwargs["json"] == {"group_ids": [5, 8]}
+
+
+def test_every_registered_account_routes_to_all_configured_groups():
+    account = _account()
+    account.plan_state = "subscribed"
+    account.overview = {"legacy_extra": {"source_trade_no": "ORDER-1"}}
+
+    with patch("application.sub2api_sync._get_sub2api_group_config", return_value={
+        "free": "free",
+        "pro": "pro",
+        "integration": "对接分组",
+        "mixed": "混合号池",
+    }):
+        assert _target_group_names(account) == ["free", "pro", "对接分组", "混合号池"]
+
+
+def test_unconfigured_extra_groups_preserve_legacy_free_route():
+    with patch("application.sub2api_sync._get_sub2api_group_config", return_value={
+        "free": "free",
+        "pro": "",
+        "integration": "",
+        "mixed": "",
+    }):
+        assert _target_group_names(_account()) == ["free"]
+
+
 def test_client_stops_before_import_when_free_group_is_missing():
     response = _response(200, {
         "code": 0,
@@ -152,6 +209,7 @@ def test_push_saved_chatgpt_account_reuses_export_format():
     assert data["type"] == "sub2api-data"
     assert data["accounts"][0]["name"] == "user@example.com"
     assert data["accounts"][0]["credentials"]["refresh_token"] == "refresh-token"
+    assert upload.call_args.kwargs["group_names"] == ["free"]
     assert any("开始上传: user@example.com -> https://sub.example.com，目标分组: free" in line for line in logs)
     assert any("✓ user@example.com 同步成功（新增 1）" in line for line in logs)
     assert all("admin-key" not in line for line in logs)

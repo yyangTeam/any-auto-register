@@ -13,6 +13,8 @@ class ConfigRepository:
         "team_manager_url", "team_manager_key",
         "any2api_url", "any2api_password",
         "sub2api_enabled", "sub2api_url", "sub2api_api_key",
+        "sub2api_free_group", "sub2api_pro_group",
+        "sub2api_integration_group", "sub2api_mixed_group",
     }
 
     def __init__(self, definitions: ProviderDefinitionsRepository | None = None):

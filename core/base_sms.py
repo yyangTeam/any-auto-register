@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -12,6 +13,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -84,6 +86,139 @@ class BaseSmsProvider(ABC):
     def get_reuse_info(self) -> dict:
         """Return provider-specific reuse state for task scheduling."""
         return {}
+
+
+class LongNotesSmsProvider(BaseSmsProvider):
+    """Per-account SMS helper exposed by a longnotes.cn share link."""
+
+    def __init__(self, share_url: str, *, proxy: str | None = None, poll_interval: float = 3.0):
+        parsed = urlparse(str(share_url or "").strip())
+        host = parsed.netloc.lower().split(":", 1)[0]
+        path_parts = [part for part in parsed.path.split("/") if part]
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not (host == "longnotes.cn" or host.endswith(".longnotes.cn"))
+            or len(path_parts) != 2
+            or path_parts[0] != "m"
+        ):
+            raise RuntimeError("LongNotes 辅助接码链接格式无效")
+        self.share_url = f"{parsed.scheme}://{parsed.netloc}/{path_parts[0]}/{path_parts[1]}"
+        self.activation_id = hashlib.sha256(self.share_url.encode("utf-8")).hexdigest()[:24]
+        self.poll_interval = max(float(poll_interval or 3.0), 0.5)
+        self.session = requests.Session()
+        if proxy:
+            self.session.proxies = {"http": proxy, "https": proxy}
+        self._bootstrapped = False
+
+    def _bootstrap(self) -> None:
+        if self._bootstrapped:
+            return
+        response = self.session.get(
+            self.share_url,
+            headers={"accept": "text/html", "user-agent": "Mozilla/5.0"},
+            timeout=25,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"LongNotes 页面初始化失败: HTTP {response.status_code}")
+        self._bootstrapped = True
+
+    def _post(self, action: str) -> dict:
+        self.raise_if_cancelled()
+        self._bootstrap()
+        response = self.session.post(
+            f"{self.share_url}/{action}",
+            headers={
+                "accept": "application/json",
+                "content-type": "application/json",
+                "user-agent": "Mozilla/5.0",
+            },
+            json={},
+            timeout=25,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"LongNotes {action} 请求失败: HTTP {response.status_code} "
+                f"{str(response.text or '')[:200]}"
+            )
+        try:
+            payload = response.json() or {}
+        except Exception as exc:
+            raise RuntimeError(f"LongNotes {action} 返回非 JSON") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"LongNotes {action} 返回类型异常")
+        if payload.get("ok") is False or payload.get("success") is False:
+            error = payload.get("error") or payload.get("message") or "请求失败"
+            raise RuntimeError(f"LongNotes {action} 失败: {error}")
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        return dict(data or {})
+
+    @staticmethod
+    def _phone_from_state(state: dict) -> str:
+        value = str(state.get("phoneNumber") or state.get("phone_number") or "").strip()
+        if not value:
+            return ""
+        normalized = re.sub(r"[^\d+]", "", value)
+        return normalized if normalized.startswith("+") else f"+{normalized}"
+
+    @staticmethod
+    def _code_from_state(state: dict) -> str:
+        messages = state.get("smsMessages") or state.get("messages") or []
+        if not isinstance(messages, list):
+            return ""
+        for item in messages:
+            if not isinstance(item, dict):
+                continue
+            direct = str(item.get("smsCode") or item.get("code") or item.get("otp") or "").strip()
+            if direct:
+                match = re.search(r"(?<!\d)(\d{4,8})(?!\d)", direct)
+                if match:
+                    return match.group(1)
+            text = str(item.get("smsText") or item.get("text") or item.get("message") or "")
+            match = re.search(r"(?<!\d)(\d{4,8})(?!\d)", text)
+            if match:
+                return match.group(1)
+        return ""
+
+    def get_number(self, *, service: str, country: str = "") -> SmsActivation:
+        state = self._post("state")
+        phone = self._phone_from_state(state)
+        if phone and not self._code_from_state(state):
+            return SmsActivation(self.activation_id, phone, country=country, metadata={"source": self.share_url})
+        if self._code_from_state(state):
+            raise RuntimeError("LongNotes 辅助接码链接已接收过验证码，无法再次分配")
+
+        state = self._post("number")
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            self.raise_if_cancelled()
+            phone = self._phone_from_state(state)
+            if phone:
+                return SmsActivation(self.activation_id, phone, country=country, metadata={"source": self.share_url})
+            if state.get("disabled"):
+                raise RuntimeError("LongNotes 辅助接码链接已禁用")
+            time.sleep(self.poll_interval)
+            state = self._post("state")
+        raise RuntimeError("LongNotes 获取手机号超时")
+
+    def get_code(self, activation_id: str, *, timeout: int = 120) -> str:
+        deadline = time.time() + max(int(timeout or 120), 1)
+        while time.time() < deadline:
+            self.raise_if_cancelled()
+            state = self._post("state")
+            code = self._code_from_state(state)
+            if code:
+                return code
+            if state.get("disabled"):
+                return ""
+            time.sleep(self.poll_interval)
+        return ""
+
+    def cancel(self, activation_id: str) -> bool:
+        try:
+            self._post("cancel")
+            return True
+        except Exception:
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -1229,6 +1364,15 @@ def create_sms_provider(provider_key: str, config: dict) -> BaseSmsProvider:
             proxy=str(config.get("sms_proxy") or config.get("proxy") or "") or None,
             reuse_phone_to_max=False,
             phone_success_max=max(0, _safe_int(config.get("register_phone_extra_max") or config.get("register_phone_success_max"), 3)),
+        )
+    if provider_key in ("longnotes_link", "auxiliary_phone_url"):
+        share_url = str(config.get("longnotes_url") or config.get("auxiliary_phone_url") or "").strip()
+        if not share_url:
+            raise RuntimeError("LongNotes 未配置辅助接码链接")
+        return LongNotesSmsProvider(
+            share_url,
+            proxy=str(config.get("sms_proxy") or config.get("proxy") or "") or None,
+            poll_interval=_safe_float(config.get("longnotes_poll_interval"), 3.0),
         )
     raise RuntimeError(f"未知的接码服务: {provider_key}")
 

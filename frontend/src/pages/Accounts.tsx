@@ -402,7 +402,7 @@ function RegisterModal({
         body: JSON.stringify({
           platform,
           count: shouldRunAllMailboxes ? 1 : regCount,
-          concurrency: shouldRunAllMailboxes ? 5 : concurrency,
+          concurrency,
           run_all_mailboxes: shouldRunAllMailboxes,
           executor_type: selection.executorType,
           captcha_solver: 'auto',

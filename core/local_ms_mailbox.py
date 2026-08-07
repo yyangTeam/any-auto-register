@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import csv
 import email as email_lib
+import html as html_lib
 import hashlib
 import imaplib
 import json
@@ -84,19 +85,23 @@ class _MailboxCardHTMLParser(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         classes = self._classes(attrs)
-        if tag == "article" and "mail-card" in classes:
+        if tag == "article" and ({"mail-card", "mail"} & classes):
             self._current = {"subject": [], "date": [], "body": []}
             self._capture_field = ""
             self._capture_tag = ""
             return
         if self._current is None:
             return
-        if tag == "span" and "subject" in classes:
+        if (tag == "span" or tag == "h2") and "subject" in classes:
             self._capture_field, self._capture_tag = "subject", tag
         elif tag == "span" and "date" in classes:
             self._capture_field, self._capture_tag = "date", tag
         elif tag == "pre" and "body" in classes:
             self._capture_field, self._capture_tag = "body", tag
+        elif tag == "iframe":
+            srcdoc = next((value or "" for key, value in attrs if key == "srcdoc"), "")
+            if srcdoc:
+                self._current["body"].append(html_lib.unescape(srcdoc))
 
     def handle_endtag(self, tag: str) -> None:
         if self._capture_tag == tag:
@@ -141,6 +146,8 @@ class LocalMicrosoftMailboxEntry:
     login_mode: str = ""
     receive_provider: str = "microsoft"
     icloud_api_url: str = ""
+    icloud_api_token: str = ""
+    auxiliary_phone_url: str = ""
     raw: str = ""
 
     @property
@@ -195,6 +202,8 @@ class LocalMicrosoftMailboxEntry:
             "login_mode": self.login_mode,
             "receive_provider": self.receive_provider,
             "icloud_api_url": self.icloud_api_url,
+            "icloud_api_token": self.icloud_api_token,
+            "auxiliary_phone_url": self.auxiliary_phone_url,
         }
 
 
@@ -250,20 +259,35 @@ def split_xinlan_common_line(line: str) -> list[str]:
             labeled_password.group(1) if labeled_password else "",
             labeled_totp.group(1) if labeled_totp else "",
         ])
-    # Match direct relay rows before fixed-width account formats. Only inspect
-    # the first separator after the @ so `email----password----url` remains a
-    # password-login row, while six-hyphen relay rows keep an intact URL.
-    at_index = text.find("@")
-    delimiter = re.search(r"-{3,}", text[at_index + 1:]) if at_index >= 0 else None
-    if delimiter:
-        delimiter_start = at_index + 1 + delimiter.start()
-        delimiter_end = at_index + 1 + delimiter.end()
-        relay_email = text[:delimiter_start].strip()
-        relay_url = text[delimiter_end:].strip()
-        if _looks_like_http_url(relay_url):
-            return [relay_email, relay_url]
-    # Four-hyphen rows may contain a password before the inbox URL. Keep long
-    # relay separators (for example 16 hyphens) on the legacy relay branch.
+    # Some relay exports append a previously issued access token after the
+    # inbox URL. Only split JWT-shaped metadata so hyphen runs inside a relay
+    # URL or FlySMS key remain part of that URL.
+    relay_with_metadata = re.fullmatch(
+        r"(?P<email>[^\s@]+@(?:(?!-{3,})[^\s])+)-{3,}"
+        r"(?P<url>https?://.*?)-{4}"
+        r"(?P<metadata>eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)",
+        text,
+        flags=re.I,
+    )
+    if relay_with_metadata:
+        return [
+            relay_with_metadata.group("email"),
+            relay_with_metadata.group("url"),
+            relay_with_metadata.group("metadata"),
+        ]
+    # URL-only relay rows may use any separator length from three hyphens up.
+    # Match them before the four-hyphen field parser so six hyphens do not
+    # leave a broken `--https://...` value.
+    relay_match = re.fullmatch(
+        r"(?P<email>[^\s@]+@(?:(?!-{3,})[^\s])+)-{3,}"
+        r"(?P<url>https?://\S+)",
+        text,
+        flags=re.I,
+    )
+    if relay_match:
+        return [relay_match.group("email"), relay_match.group("url")]
+
+    # Four-hyphen rows may contain a password before the inbox URL.
     if "----" in text:
         hyphen_parts = text.split("----")
         if all(part.strip() for part in hyphen_parts):
@@ -302,6 +326,15 @@ def split_xinlan_common_line(line: str) -> list[str]:
             return [triple_parts[0].strip(), "---".join(triple_parts[1:-1]).strip(), triple_parts[-1].strip()]
     if text.count("|") >= 2:
         pipe_parts = _strip_trailing_statuses(text.split("|"))
+        # Some registered-account exports append an order/account reference:
+        #   email|OpenAI password|MFA secret|reference
+        # The reference is not a credential. Detect the MFA in column three
+        # before applying the legacy first/last separator rule, which is kept
+        # for passwords that legitimately contain pipe characters.
+        if len(pipe_parts) == 4:
+            third_field_totp = re.sub(r"[\s-]+", "", _safe_text(pipe_parts[2])).upper()
+            if re.fullmatch(r"[A-Z2-7]{16,}", third_field_totp):
+                return [pipe_parts[0].strip(), pipe_parts[1], third_field_totp]
         return [pipe_parts[0].strip(), "|".join(pipe_parts[1:-1]), pipe_parts[-1].strip()]
     if "\t" in text:
         return _strip_trailing_statuses([item.strip() for item in text.split("\t")])
@@ -310,6 +343,30 @@ def split_xinlan_common_line(line: str) -> list[str]:
     if "," in text:
         return _strip_trailing_statuses([item.strip() for item in _csv_split(text, ",")])
     return _strip_trailing_statuses([item.strip() for item in re.split(r"\s+", text) if item.strip()])
+
+
+def _parse_labeled_auxiliary_row(line: str) -> dict[str, str] | None:
+    """Parse a mailbox URL plus a per-account Codex phone helper URL."""
+    match = re.fullmatch(
+        r"\s*邮箱接验证码登录\s*-{2,}\s*"
+        r"(?P<email>[^\s]+?@[^\s]+?)-{3,}\s*"
+        r"邮箱接码链接\s*[：:+]?\s*"
+        r"(?P<mail_url>https?://.*?)(?=-{4,}\s*辅助绑定)"
+        r"-{4,}\s*辅助绑定\s*(?:coedx|codex)\s*电话\s*[+：:]?\s*"
+        r"(?P<phone_url>https?://\S+)\s*",
+        str(line or ""),
+        flags=re.I,
+    )
+    if not match:
+        return None
+    values = {key: _safe_text(value) for key, value in match.groupdict().items()}
+    if (
+        "@" not in values["email"]
+        or not _looks_like_http_url(values["mail_url"])
+        or not _looks_like_http_url(values["phone_url"])
+    ):
+        return None
+    return values
 
 
 def _email_domain(value: str) -> str:
@@ -324,7 +381,11 @@ def _looks_like_http_url(value: str) -> bool:
         return False
 
 
-def _parse_flysms_pickup_url(value: str, expected_email: str) -> tuple[str, str] | None:
+def _parse_flysms_pickup_url(
+    value: str,
+    expected_email: str,
+    explicit_token: str = "",
+) -> tuple[str, str] | None:
     """Return FlySMS pickup credentials, or None for a non-FlySMS URL."""
     try:
         parsed = urlparse(str(value or "").strip())
@@ -333,9 +394,12 @@ def _parse_flysms_pickup_url(value: str, expected_email: str) -> tuple[str, str]
 
     is_flysms = (
         parsed.scheme == "https"
-        and (parsed.hostname or "").lower() == FLYSMS_PICKUP_HOST
+        and (
+            (parsed.hostname or "").lower() == FLYSMS_PICKUP_HOST
+            or (parsed.hostname or "").lower().endswith(f".{FLYSMS_PICKUP_HOST}")
+        )
         and parsed.port in (None, 443)
-        and parsed.path.rstrip("/") == FLYSMS_PICKUP_PATH
+        and parsed.path.rstrip("/").lower() == FLYSMS_PICKUP_PATH
     )
     if not is_flysms:
         return None
@@ -343,16 +407,48 @@ def _parse_flysms_pickup_url(value: str, expected_email: str) -> tuple[str, str]
         raise RuntimeError("FlySMS 取件链接无效: 不支持查询参数或 URL 内嵌账号")
 
     params = parse_qs(parsed.fragment, keep_blank_values=True)
-    if set(params) != {"email", "key"} or len(params["email"]) != 1 or len(params["key"]) != 1:
-        raise RuntimeError("FlySMS 取件链接无效: #email 和 key 必须各出现一次")
+    if set(params) - {"email", "key", "token"} or len(params.get("email") or []) != 1:
+        raise RuntimeError("FlySMS 取件链接无效: #email 必须出现一次")
 
     email = _safe_text(params["email"][0]).lower()
-    token = _safe_text(params["key"][0])
+    fragment_tokens = list(params.get("key") or []) + list(params.get("token") or [])
+    if len(fragment_tokens) > 1:
+        raise RuntimeError("FlySMS 取件链接无效: key/token 只能出现一次")
+    fragment_token = _safe_text(fragment_tokens[0]) if fragment_tokens else ""
+    token = _safe_text(explicit_token) or fragment_token
+    if explicit_token and fragment_token and _safe_text(explicit_token) != fragment_token:
+        raise RuntimeError("FlySMS 取件链接中的 key 与账号池 token 不一致")
     if email != _safe_text(expected_email).lower():
         raise RuntimeError("FlySMS 取件链接中的邮箱与账号池邮箱不一致")
     if not FLYSMS_TOKEN_RE.fullmatch(token):
         raise RuntimeError("FlySMS 取件链接中的 key 格式无效")
     return email, token
+
+
+def _is_rangertalking_pickup_url(value: str) -> bool:
+    try:
+        parsed = urlparse(str(value or "").strip())
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower()
+    return (
+        parsed.scheme in {"http", "https"}
+        and (host == "rangertalking.com" or host.endswith(".rangertalking.com"))
+        and parsed.path.rstrip("/").lower() == "/pickup"
+    )
+
+
+def _is_flysms_pickup_url(value: str) -> bool:
+    try:
+        parsed = urlparse(str(value or "").strip())
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower()
+    return (
+        parsed.scheme == "https"
+        and (host == "flysms.xyz" or host.endswith(".flysms.xyz"))
+        and parsed.path.rstrip("/").lower() == "/icloud/pickup"
+    )
 
 
 def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
@@ -361,6 +457,21 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
     for raw_line in str(text or "").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or line.startswith("//") or line.startswith("'"):
+            continue
+        labeled_auxiliary = _parse_labeled_auxiliary_row(line)
+        if labeled_auxiliary:
+            entry = LocalMicrosoftMailboxEntry(
+                email=labeled_auxiliary["email"],
+                login_account=labeled_auxiliary["email"],
+                login_mode="email_otp_only",
+                receive_provider="icloud_api",
+                icloud_api_url=labeled_auxiliary["mail_url"],
+                auxiliary_phone_url=labeled_auxiliary["phone_url"],
+                raw=line,
+            )
+            if entry.key not in seen:
+                seen.add(entry.key)
+                entries.append(entry)
             continue
         parts = split_xinlan_common_line(line)
         if not parts:
@@ -382,6 +493,7 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
             entry = LocalMicrosoftMailboxEntry(
                 email=email,
                 login_account=email,
+                login_mode="email_otp_only",
                 receive_provider="icloud_api",
                 icloud_api_url=_safe_text(parts[1]),
                 raw=line,
@@ -416,6 +528,16 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
             len(parts) == 3
             and _looks_like_http_url(_safe_text(parts[2]))
         )
+        rangertalking_pickup = (
+            password_with_inbox
+            and _is_rangertalking_pickup_url(_safe_text(parts[2]))
+            and bool(_safe_text(parts[1]))
+        )
+        flysms_pickup = (
+            password_with_inbox
+            and _is_flysms_pickup_url(_safe_text(parts[2]))
+            and _safe_text(parts[1]).startswith("tok_")
+        )
         password_with_inbox_and_totp_url = (
             len(parts) == 4
             and _looks_like_http_url(_safe_text(parts[2]))
@@ -433,7 +555,27 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
                     and re.fullmatch(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", maybe_access_token)
                 )
 
-        if password_with_inbox_and_totp_url:
+        if flysms_pickup:
+            entry = LocalMicrosoftMailboxEntry(
+                email=email,
+                login_account=email,
+                login_mode="email_otp_only",
+                receive_provider="icloud_api",
+                icloud_api_url=_safe_text(parts[2]),
+                icloud_api_token=_safe_text(parts[1]),
+                raw=line,
+            )
+        elif rangertalking_pickup:
+            entry = LocalMicrosoftMailboxEntry(
+                email=email,
+                login_account=email,
+                login_mode="email_otp_only",
+                receive_provider="icloud_api",
+                icloud_api_url=_safe_text(parts[2]),
+                icloud_api_token=_safe_text(parts[1]),
+                raw=line,
+            )
+        elif password_with_inbox_and_totp_url:
             entry = LocalMicrosoftMailboxEntry(
                 email=email,
                 password=_safe_text(parts[1]),
@@ -510,6 +652,8 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
     """Use existing mailbox accounts from a local text pool."""
 
     _lock = threading.Lock()
+    _flysms_request_lock = threading.Lock()
+    _flysms_next_request_at = 0.0
 
     def __init__(
         self,
@@ -520,6 +664,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         graph_scope: str = "",
         allow_reuse: bool = False,
         avoid_repeat: bool = False,
+        include_retry_rows: bool = False,
         failure_cooldown_seconds: int = 0,
         proxy: str = None,
     ):
@@ -529,11 +674,14 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         self.graph_scope = str(graph_scope or DEFAULT_GRAPH_SCOPE).strip()
         self.allow_reuse = bool(allow_reuse)
         self.avoid_repeat = bool(avoid_repeat)
+        # Failed rows are a separate, user-controlled pool. Regular runs must
+        # never consume them merely because they are available in the state file.
+        self.include_retry_rows = bool(include_retry_rows)
         self._attempted_keys: set[str] = set()
         self.failure_cooldown_seconds = max(int(failure_cooldown_seconds or 0), 0)
         self.proxy = {"http": proxy, "https": proxy} if proxy else None
         self._oauth_mail_strategy: dict[str, str] = {}
-        self._flysms_detail_cache: dict[tuple[str, str, int], dict] = {}
+        self._flysms_detail_cache: dict[tuple[str, str, str], dict] = {}
 
     @classmethod
     def from_config(cls, config: dict) -> "LocalMicrosoftMailboxPool":
@@ -544,18 +692,20 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             graph_scope=config.get("local_ms_graph_scope", ""),
             allow_reuse=_truthy(config.get("local_mail_pool_allow_reuse") if "local_mail_pool_allow_reuse" in config else config.get("local_ms_pool_allow_reuse")),
             avoid_repeat=_truthy(config.get("local_mail_pool_avoid_repeat")),
+            include_retry_rows=_truthy(config.get("local_mail_pool_include_retry_rows")),
             failure_cooldown_seconds=config.get("local_mail_pool_failure_cooldown_seconds", 0),
             proxy=config.get("proxy") or None,
         )
 
-    def _load_pool_text(self) -> str:
+    def _load_pool_text(self, *, include_retry_rows: bool | None = None) -> str:
         chunks: list[str] = []
         state = self._state()
         retry_rows = dict(state.get("retry_rows") or {})
         pending_rows = dict(state.get("pending_rows") or {})
+        include_retry_rows = self.include_retry_rows if include_retry_rows is None else include_retry_rows
         managed_rows = [
             str(item.get("raw") or "").strip()
-            for rows in (retry_rows, pending_rows)
+            for rows in ((retry_rows,) if include_retry_rows else ()) + (pending_rows,)
             for item in rows.values()
             if isinstance(item, dict) and str(item.get("raw") or "").strip()
         ]
@@ -573,14 +723,14 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             raise RuntimeError("本地邮箱池为空，请粘贴心蓝格式、邮箱接码地址、密码 + MFA 账号或配置文件路径")
         return combined
 
-    def _entries(self) -> list[LocalMicrosoftMailboxEntry]:
-        entries = parse_xinlan_common_rows(self._load_pool_text())
+    def _entries(self, *, include_retry_rows: bool | None = None) -> list[LocalMicrosoftMailboxEntry]:
+        entries = parse_xinlan_common_rows(self._load_pool_text(include_retry_rows=include_retry_rows))
         if not entries:
             raise RuntimeError("本地邮箱池未解析到有效邮箱")
         return entries
 
-    def _usable_entries(self) -> list[LocalMicrosoftMailboxEntry]:
-        entries = [entry for entry in self._entries() if entry.usable_ready]
+    def _usable_entries(self, *, include_retry_rows: bool | None = None) -> list[LocalMicrosoftMailboxEntry]:
+        entries = [entry for entry in self._entries(include_retry_rows=include_retry_rows) if entry.usable_ready]
         if not entries:
             raise RuntimeError("本地邮箱池没有可用账号，请提供密码 + MFA，或接码 URL、Microsoft OAuth、IMAP 收件配置")
         return entries
@@ -634,7 +784,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         if not key:
             return False
         with self._lock:
-            entries = {entry.key: entry for entry in self._entries()}
+            entries = {entry.key: entry for entry in self._entries(include_retry_rows=True)}
             state = self._state()
             used = dict(state.get("used") or {})
             if key not in used:
@@ -793,7 +943,11 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             return {
                 "new_count": len(pending_rows),
                 "failed_count": len(retry_rows),
-                "available_count": sum(1 for item in items if not item["in_use"]),
+                # This is the automatic-registration capacity: only new rows.
+                # Failed rows remain visible but are deliberately manual-only.
+                "available_count": sum(
+                    1 for item in items if item["status"] == "new" and not item["in_use"]
+                ),
                 "running_count": sum(1 for item in items if item["in_use"]),
                 "items": items,
             }
@@ -943,7 +1097,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         key = str(email or "").strip().lower()
         if not key:
             return ""
-        for entry in self._entries():
+        for entry in self._entries(include_retry_rows=True):
             if entry.key == key:
                 return entry.raw
         return ""
@@ -996,21 +1150,33 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         with self._lock:
             return self._reserve_entry(self._available_entry())
 
-    def get_email_by_address(self, email: str) -> MailboxAccount:
-        """Reserve the exact local-pool row requested by a single-email task."""
+    def _validate_email_address_unlocked(self, email: str) -> LocalMicrosoftMailboxEntry:
         key = str(email or "").strip().lower()
         if not key:
             raise ValueError("指定邮箱不能为空")
+        entry = next((item for item in self._usable_entries(include_retry_rows=True) if item.key == key), None)
+        if entry is None:
+            raise RuntimeError(f"指定邮箱不在本地邮箱池中或格式不可用: {email}")
+        state = self._state()
+        used = set((state.get("used") or {}).keys())
+        if not self.allow_reuse and entry.key in used:
+            raise RuntimeError(f"指定邮箱已被占用或已注册: {entry.email}")
+        if self.avoid_repeat and entry.key in self._attempted_keys:
+            raise RuntimeError(f"指定邮箱本次任务已经尝试过: {entry.email}")
+        return entry
+
+    def validate_email_address(self, email: str) -> LocalMicrosoftMailboxEntry:
+        """Validate an explicit manual-retry address without reserving it."""
         with self._lock:
-            entry = next((item for item in self._usable_entries() if item.key == key), None)
-            if entry is None:
-                raise RuntimeError(f"指定邮箱不在本地邮箱池中或格式不可用: {email}")
-            state = self._state()
-            used = set((state.get("used") or {}).keys())
-            if not self.allow_reuse and entry.key in used:
-                raise RuntimeError(f"指定邮箱已被占用或已注册: {entry.email}")
-            if self.avoid_repeat and entry.key in self._attempted_keys:
-                raise RuntimeError(f"指定邮箱本次任务已经尝试过: {entry.email}")
+            return self._validate_email_address_unlocked(email)
+
+    def get_email_by_address(self, email: str) -> MailboxAccount:
+        """Reserve the exact local-pool row requested by a single-email task."""
+        with self._lock:
+            # A typed address is an explicit manual retry request. It may target
+            # the accumulated-failure pool, while automatic allocation remains
+            # restricted to newly imported rows.
+            entry = self._validate_email_address_unlocked(email)
             return self._reserve_entry(entry)
 
     def _entry_for_account(self, account: MailboxAccount) -> LocalMicrosoftMailboxEntry:
@@ -1036,6 +1202,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 login_mode=str(credentials.get("login_mode") or ""),
                 receive_provider=str(credentials.get("receive_provider") or "microsoft"),
                 icloud_api_url=str(credentials.get("icloud_api_url") or ""),
+                icloud_api_token=str(credentials.get("icloud_api_token") or ""),
             )
 
         for entry in self._entries():
@@ -1254,131 +1421,6 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         material = "\n".join(str(part or "") for part in parts)
         return hashlib.sha256(material.encode("utf-8", errors="ignore")).hexdigest()[:24]
 
-    def _flysms_messages(self, entry: LocalMicrosoftMailboxEntry, email: str, token: str) -> list[dict]:
-        headers = {
-            "accept": "application/json",
-            "authorization": f"Bearer {token}",
-            "x-mailbox-email": email,
-            "user-agent": "Mozilla/5.0",
-            "cache-control": "no-cache, no-store",
-            "pragma": "no-cache",
-        }
-        response = requests.get(
-            FLYSMS_MESSAGES_URL,
-            headers=headers,
-            params={"limit": FLYSMS_MESSAGE_LIMIT},
-            proxies=self.proxy,
-            timeout=25,
-        )
-        if response.status_code == 404:
-            return []
-        if response.status_code != 200:
-            errors = {
-                401: "邮箱或 key 无效",
-                403: "邮箱已到期、停用或无权取件",
-                429: "请求过于频繁",
-                503: "邮箱正在同步或服务暂时不可用",
-            }
-            detail = errors.get(response.status_code, "收件请求失败")
-            retry_after = str(response.headers.get("retry-after") or "").strip()
-            if response.status_code == 429 and retry_after:
-                detail += f"，请在 {retry_after} 秒后重试"
-            raise RuntimeError(f"FlySMS {detail}: HTTP {response.status_code}")
-
-        try:
-            payload = response.json()
-        except Exception as exc:
-            raise RuntimeError("FlySMS 返回了无法解析的邮件数据") from exc
-        if not isinstance(payload, dict):
-            raise RuntimeError("FlySMS 返回了无法识别的邮件数据")
-
-        response_email = _safe_text(payload.get("email")).lower()
-        if response_email and response_email != entry.key:
-            raise RuntimeError("FlySMS 返回的邮箱与账号池邮箱不一致")
-
-        summaries = payload.get("messages")
-        if not isinstance(summaries, list):
-            raise RuntimeError("FlySMS 返回了无法识别的邮件列表")
-
-        messages: list[dict] = []
-        for summary in summaries[:FLYSMS_MESSAGE_LIMIT]:
-            if not isinstance(summary, dict):
-                continue
-            mailbox = _safe_text(summary.get("mailbox")) or "INBOX"
-            try:
-                uid = int(summary.get("uid") or 0)
-            except (TypeError, ValueError):
-                continue
-            if uid <= 0:
-                continue
-
-            cache_key = (entry.key, mailbox, uid)
-            message = self._flysms_detail_cache.get(cache_key)
-            detail_pending = False
-            if message is None:
-                detail_response = requests.get(
-                    f"{FLYSMS_MESSAGES_URL}/{uid}",
-                    headers=headers,
-                    params={"mailbox": mailbox},
-                    proxies=self.proxy,
-                    timeout=25,
-                )
-                if detail_response.status_code == 404:
-                    message = dict(summary)
-                    detail_pending = True
-                elif detail_response.status_code != 200:
-                    message = dict(summary)
-                    detail_pending = True
-                    logger.warning(
-                        "FlySMS 邮件详情暂不可用: email=%s uid=%s HTTP %s",
-                        entry.email,
-                        uid,
-                        detail_response.status_code,
-                    )
-                else:
-                    try:
-                        detail_payload = detail_response.json()
-                    except Exception as exc:
-                        raise RuntimeError("FlySMS 返回了无法解析的邮件详情") from exc
-                    if not isinstance(detail_payload, dict):
-                        raise RuntimeError("FlySMS 返回了无法识别的邮件详情")
-                    detail_email = _safe_text(detail_payload.get("email")).lower()
-                    if detail_email and detail_email != entry.key:
-                        raise RuntimeError("FlySMS 返回的邮箱与账号池邮箱不一致")
-                    detail_message = detail_payload.get("message")
-                    if isinstance(detail_message, dict):
-                        message = detail_message
-                    else:
-                        message = dict(summary)
-                        detail_pending = True
-                if not detail_pending:
-                    self._flysms_detail_cache[cache_key] = message
-
-            subject = _safe_text(message.get("subject") or summary.get("subject"))
-            body = " ".join(
-                value
-                for value in (
-                    subject,
-                    _safe_text(message.get("text")),
-                    _safe_text(message.get("html")),
-                    _safe_text(message.get("preview") or summary.get("preview")),
-                    _safe_text(message.get("from") or summary.get("from")),
-                )
-                if value
-            )
-            received = self._first_json_text(
-                message,
-                ("mailboxReceivedAt", "date", "ingestedAt", "sentAt"),
-            ) or self._first_json_text(summary, ("mailboxReceivedAt", "date", "ingestedAt"))
-            messages.append({
-                "id": self._stable_message_id("flysms", entry.key, mailbox, uid),
-                "subject": subject,
-                "bodyPreview": body,
-                "receivedDateTime": received,
-                "_detail_pending": detail_pending,
-            })
-        return messages
-
     @staticmethod
     def _tokenized_latest_endpoint(url: str) -> str | None:
         parsed = urlparse(str(url or "").strip())
@@ -1520,6 +1562,156 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         return f"{parsed.scheme}://{parsed.netloc}/public-api/v1/check", fragment
 
     @staticmethod
+    def _rangertalking_verification_endpoint(entry: LocalMicrosoftMailboxEntry) -> str | None:
+        if not entry.icloud_api_token or not _is_rangertalking_pickup_url(entry.icloud_api_url):
+            return None
+        parsed = urlparse(entry.icloud_api_url)
+        return f"{parsed.scheme}://{parsed.netloc}/api/v1/verification-code"
+
+    @staticmethod
+    def _flysms_pickup_endpoint(
+        entry: LocalMicrosoftMailboxEntry,
+    ) -> tuple[str, str, str] | None:
+        credentials = _parse_flysms_pickup_url(
+            entry.icloud_api_url,
+            entry.email,
+            entry.icloud_api_token,
+        )
+        if not credentials:
+            return None
+        parsed = urlparse(entry.icloud_api_url)
+        email, token = credentials
+        endpoint = f"{parsed.scheme}://{parsed.netloc}/icloud/api/pickup/messages"
+        return endpoint, email, token
+
+    def _flysms_api_messages(
+        self,
+        entry: LocalMicrosoftMailboxEntry,
+        endpoint: tuple[str, str, str],
+    ) -> list[dict]:
+        api_url, email, token = endpoint
+        headers = {
+            "accept": "application/json",
+            "authorization": f"Bearer {token}",
+            "x-mailbox-email": email,
+            "user-agent": "Mozilla/5.0",
+            "cache-control": "no-cache, no-store",
+            "pragma": "no-cache",
+        }
+        response = self._flysms_get(
+            api_url,
+            headers=headers,
+            params={"limit": FLYSMS_MESSAGE_LIMIT},
+            timeout=25,
+        )
+        if response.status_code == 404:
+            return []
+        if response.status_code != 200:
+            retry_after = str(response.headers.get("retry-after") or "").strip()
+            retry_detail = f"，Retry-After={retry_after}s" if retry_after else ""
+            raise RuntimeError(
+                f"flysms 邮件列表读取失败: HTTP {response.status_code}{retry_detail} {response.text[:200]}"
+            )
+        payload = response.json() or {}
+        response_email = _safe_text(payload.get("email")).lower()
+        if response_email and response_email != entry.key:
+            raise RuntimeError("FlySMS 返回的邮箱与账号池邮箱不一致")
+        items = payload.get("messages") or payload.get("items") or []
+        if not isinstance(items, list):
+            return []
+
+        messages: list[dict] = []
+        for item in items[:FLYSMS_MESSAGE_LIMIT]:
+            if not isinstance(item, dict):
+                continue
+            merged = dict(item)
+            uid = str(item.get("uid") or item.get("id") or "").strip()
+            mailbox = str(item.get("mailbox") or "INBOX").strip()
+            detail_pending = False
+            if uid:
+                cache_key = (email.lower(), mailbox.lower(), uid)
+                detail = self._flysms_detail_cache.get(cache_key)
+                if detail is None:
+                    try:
+                        detail_response = self._flysms_get(
+                            f"{api_url}/{quote(uid, safe='')}",
+                            headers=headers,
+                            params={"mailbox": mailbox},
+                            timeout=15,
+                        )
+                        if detail_response.status_code == 429:
+                            retry_after = str(detail_response.headers.get("retry-after") or "").strip()
+                            retry_detail = f"，Retry-After={retry_after}s" if retry_after else ""
+                            raise RuntimeError(
+                                f"flysms 邮件详情读取失败: HTTP 429{retry_detail} "
+                                f"{detail_response.text[:200]}"
+                            )
+                        if detail_response.status_code == 200:
+                            detail_payload = detail_response.json() or {}
+                            detail_email = _safe_text(detail_payload.get("email")).lower()
+                            if detail_email and detail_email != entry.key:
+                                raise RuntimeError("FlySMS 返回的邮箱与账号池邮箱不一致")
+                            detail = detail_payload.get("message") or detail_payload
+                            if isinstance(detail, dict):
+                                self._flysms_detail_cache[cache_key] = dict(detail)
+                        else:
+                            detail_pending = True
+                    except RuntimeError:
+                        # Do not return an incomplete message with the real UID:
+                        # wait_for_code would mark it as seen before its OTP body
+                        # can be fetched after the rate-limit window.
+                        raise
+                    except Exception:
+                        detail = None
+                        detail_pending = True
+                if isinstance(detail, dict):
+                    merged.update(detail)
+            subject = self._first_json_text(merged, ("subject", "title"))
+            body = self._first_json_text(
+                merged,
+                ("text", "html", "body", "preview", "bodyPreview", "content"),
+            )
+            sender = self._first_json_text(merged, ("from", "sender"))
+            received = self._first_json_text(
+                merged,
+                ("mailboxReceivedAt", "ingestedAt", "date", "sentAt", "receivedDateTime"),
+            )
+            messages.append({
+                "id": uid or self._stable_message_id(email, subject, body, received),
+                "subject": subject,
+                "bodyPreview": " ".join(value for value in (subject, body, sender) if value),
+                "receivedDateTime": received,
+                "_detail_pending": detail_pending,
+            })
+        return messages
+
+    def _flysms_get(self, url: str, *, headers: dict, params: dict, timeout: int):
+        """Serialize FlySMS requests and honor its global Retry-After window."""
+        with self._flysms_request_lock:
+            wait_seconds = self._flysms_next_request_at - time.time()
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            response = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                proxies=self.proxy,
+                timeout=timeout,
+            )
+            now = time.time()
+            if response.status_code == 429:
+                try:
+                    retry_after = max(float(response.headers.get("retry-after") or 60), 1.0)
+                except (TypeError, ValueError):
+                    retry_after = 60.0
+                type(self)._flysms_next_request_at = now + min(retry_after + 1.0, 120.0)
+            else:
+                # Avoid a burst of list/detail requests when several FlySMS
+                # mailboxes are processed by the same concurrent task.
+                type(self)._flysms_next_request_at = now + 0.5
+            return response
+
+    @staticmethod
     def _json_code_values(payload: Any) -> list[str]:
         if not isinstance(payload, dict):
             return []
@@ -1554,9 +1746,6 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
     def _icloud_api_messages(self, entry: LocalMicrosoftMailboxEntry) -> list[dict]:
         if not entry.icloud_api_ready:
             raise RuntimeError(f"iCloud 邮箱缺少接码地址: {entry.email}")
-        flysms_credentials = _parse_flysms_pickup_url(entry.icloud_api_url, entry.email)
-        if flysms_credentials:
-            return self._flysms_messages(entry, *flysms_credentials)
         yangyang_endpoint = self._yangyang_messages_endpoint(entry.icloud_api_url)
         if yangyang_endpoint:
             try:
@@ -1564,6 +1753,9 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             except RuntimeError as exc:
                 if "HTTP 404" not in str(exc):
                     raise
+        flysms_endpoint = self._flysms_pickup_endpoint(entry)
+        if flysms_endpoint:
+            return self._flysms_api_messages(entry, flysms_endpoint)
         mailroom_endpoint = self._mailroom_public_endpoint(entry.icloud_api_url)
         headers = {
             "accept": "application/json,text/html,text/plain,*/*",
@@ -1572,6 +1764,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             "pragma": "no-cache",
         }
         tokenized_latest_endpoint = self._tokenized_latest_endpoint(entry.icloud_api_url)
+        rangertalking_endpoint = self._rangertalking_verification_endpoint(entry)
         if mailroom_endpoint:
             api_url, share_token = mailroom_endpoint
             response = requests.post(
@@ -1583,6 +1776,13 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                     "cache-control": headers["cache-control"],
                     "pragma": headers["pragma"],
                 },
+                proxies=self.proxy,
+                timeout=25,
+            )
+        elif rangertalking_endpoint:
+            response = requests.get(
+                rangertalking_endpoint,
+                headers={**headers, "X-Access-Key": entry.icloud_api_token},
                 proxies=self.proxy,
                 timeout=25,
             )
@@ -1798,8 +1998,12 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         start = time.time()
         try:
             entry = self._entry_for_account(account)
-            poll_interval = 10 if self._mailroom_public_endpoint(entry.icloud_api_url) else 5
-            is_flysms = bool(_parse_flysms_pickup_url(entry.icloud_api_url, entry.email))
+            is_flysms = _is_flysms_pickup_url(entry.icloud_api_url)
+            slow_relay = bool(
+                self._mailroom_public_endpoint(entry.icloud_api_url)
+                or is_flysms
+            )
+            poll_interval = 10 if slow_relay else 5
             provider_name = "flysms" if is_flysms else entry.source
         except Exception:
             poll_interval = 5

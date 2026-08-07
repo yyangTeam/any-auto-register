@@ -1,12 +1,15 @@
 """ChatGPT 浏览器注册流程（Camoufox）。"""
 import base64
+import inspect
 import json
 import os
 import random
 import re
 import secrets
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from typing import Callable, Optional
 from urllib.parse import urljoin, urlparse
 
@@ -22,6 +25,33 @@ from .constants import (
     SENTINEL_BASE,
     OAUTH_CONSENT_FORM_SELECTOR,
 )
+
+
+def _browser_concurrency_limit() -> int:
+    default_limit = 5 if (os.cpu_count() or 1) >= 8 else 2
+    try:
+        configured = os.environ.get("CHATGPT_CODEX_BROWSER_CONCURRENCY", str(default_limit))
+        return min(5, max(1, int(configured or default_limit)))
+    except (TypeError, ValueError):
+        return default_limit
+
+
+CODEX_BROWSER_CONCURRENCY = _browser_concurrency_limit()
+_CODEX_BROWSER_SEMAPHORE = threading.BoundedSemaphore(CODEX_BROWSER_CONCURRENCY)
+
+
+@contextmanager
+def _codex_browser_slot(log):
+    started = time.time()
+    if not _CODEX_BROWSER_SEMAPHORE.acquire(timeout=600):
+        raise RuntimeError("等待 Codex 浏览器资源槽超时")
+    waited = time.time() - started
+    if waited >= 1:
+        log(f"  已等待 {waited:.1f} 秒获得 Codex 浏览器资源槽（上限 {CODEX_BROWSER_CONCURRENCY}）")
+    try:
+        yield
+    finally:
+        _CODEX_BROWSER_SEMAPHORE.release()
 
 EMAIL_INPUT_SELECTORS = [
     'input#login-email',
@@ -110,6 +140,48 @@ PASSWORDLESS_LOGIN_SELECTORS = [
     'button:has-text("code unique")',
     'button:has-text("Einmalcode")',
     'button:has-text("código de uso único")',
+]
+
+PASSWORD_RESET_LINK_SELECTORS = [
+    'a[href*="/reset-password"]',
+    'a:has-text("Forgot password")',
+    'button:has-text("Forgot password")',
+    'a:has-text("忘记密码")',
+    'button:has-text("忘记密码")',
+]
+
+PASSWORD_RESET_SEND_SELECTORS = [
+    'button[name="intent"][value="send_otp"]',
+    'button[value="send_otp"]',
+    'button[type="submit"]',
+    'button:has-text("Continue")',
+    'button:has-text("继续")',
+]
+
+MFA_OTHER_METHOD_SELECTORS = [
+    'button:has-text("Try another method")',
+    'a:has-text("Try another method")',
+    'a[href="/mfa-challenge"]',
+    'button:has-text("Use another method")',
+    'a:has-text("Use another method")',
+    'button:has-text("Another way")',
+    'a:has-text("Another way")',
+    'button:has-text("其他方式")',
+    'a:has-text("其他方式")',
+    'button:has-text("其他验证方式")',
+    'a:has-text("其他验证方式")',
+]
+
+MFA_EMAIL_METHOD_SELECTORS = [
+    'button[name="intent"][value*="email" i]',
+    'button[value*="email" i]',
+    'button:has-text("Email")',
+    'a:has-text("Email")',
+    'a[href*="email" i]',
+    '[role="button"]:has-text("Email")',
+    'button:has-text("邮箱")',
+    'a:has-text("邮箱")',
+    '[role="button"]:has-text("邮箱")',
 ]
 
 # add-phone 页面国际拨号码 -> 国家名映射（用于 UI 下拉选择）
@@ -882,6 +954,40 @@ def _get_visible_page_text(page) -> str:
         return ""
 
 
+def _auth_page_diagnostic(page) -> str:
+    """Return a compact auth-page snapshot without field values or secrets."""
+    try:
+        snapshot = page.evaluate(
+            """
+            () => ({
+              url: String(location.href || ''),
+              text: String(document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 600),
+              inputs: Array.from(document.querySelectorAll('input')).map((el) => ({
+                type: String(el.type || ''),
+                name: String(el.name || ''),
+                id: String(el.id || ''),
+                autocomplete: String(el.autocomplete || ''),
+                placeholder: String(el.placeholder || ''),
+                inputmode: String(el.inputMode || ''),
+                visible: !!el.offsetParent,
+              })),
+              controls: Array.from(document.querySelectorAll('button, a, [role="button"]'))
+                .filter((el) => !!el.offsetParent)
+                .slice(0, 20)
+                .map((el) => ({
+                  text: String(el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim(),
+                  name: String(el.getAttribute('name') || ''),
+                  value: String(el.getAttribute('value') || ''),
+                  href: String(el.getAttribute('href') || ''),
+                })),
+            })
+            """
+        )
+        return json.dumps(snapshot or {}, ensure_ascii=False, separators=(",", ":"))[:1800]
+    except Exception as exc:
+        return f"snapshot_error={exc}"
+
+
 def _whatsapp_verification_reason(page_text: str, channel: str = "") -> str:
     """Return a reason only when the page is actively requiring WhatsApp."""
     text = re.sub(r"\s+", " ", str(page_text or "")).strip()
@@ -1166,6 +1272,130 @@ def _reset_existing_account_password(page, password: str, otp_callback, log) -> 
     if not _wait_for_url(page, "log-in/password", timeout=15):
         return {"ok": False, "url": str(page.url or ""), "text": "密码重置成功后未返回登录密码页"}
     return {"ok": True, "url": str(page.url or ""), "text": ""}
+
+
+def _is_rejected_login_password(error: str) -> bool:
+    text = re.sub(r"\s+", " ", str(error or "")).strip().lower()
+    return bool(
+        re.search(
+            r"incorrect (?:email address or )?password|invalid password|wrong password|"
+            r"密码(?:不正确|错误|无效)|密码和邮箱不匹配",
+            text,
+            flags=re.I,
+        )
+    )
+
+
+def _password_reset_page_type(page) -> str:
+    current_url = str(page.url or "")
+    if "reset-password" not in current_url.lower():
+        return ""
+    otp_selector = _find_first_selector(page, OTP_INPUT_SELECTORS)
+    if otp_selector and "password" not in otp_selector.lower():
+        return "reset_password_otp"
+    if _find_first_selector(page, PASSWORD_INPUT_SELECTORS):
+        return "reset_password_new_password"
+    page_text = re.sub(r"\s+", " ", _get_visible_page_text(page)).strip().lower()
+    if re.search(
+        r"check your inbox|verification code we (?:just )?sent|enter (?:the )?verification code|"
+        r"(?:验证码|驗證碼|代码|代碼).{0,80}(?:邮箱|郵箱|邮件|郵件|发送|發送)",
+        page_text,
+        flags=re.I,
+    ):
+        # The reset form is a same-URL SPA.  On a slow render the explanatory
+        # text can update before Playwright can resolve the OTP input.
+        return "reset_password_otp"
+    return "reset_password_start"
+
+
+def _start_password_reset(page, log, otp_sent_callback=None) -> bool:
+    reset_url = ""
+    try:
+        reset_url = str(
+            page.evaluate(
+                """
+                () => {
+                  const node = Array.from(document.querySelectorAll('a[href], button'))
+                    .find((el) => /forgot password|忘记密码/i.test(String(el.innerText || el.textContent || ''))
+                      || String(el.href || el.getAttribute('href') || '').toLowerCase().includes('/reset-password'));
+                  return String(node?.href || node?.getAttribute?.('href') || '');
+                }
+                """
+            )
+            or ""
+        ).strip()
+    except Exception:
+        reset_url = ""
+    reset_url = _normalize_url(reset_url or f"{OPENAI_AUTH}/reset-password", OPENAI_AUTH)
+    log("  OAuth 密码不可用，进入重置密码流程...")
+    page.goto(reset_url, wait_until="domcontentloaded", timeout=30000)
+    if _password_reset_page_type(page) != "reset_password_start":
+        return True
+    if callable(otp_sent_callback):
+        otp_sent_callback()
+    selector = _click_first(page, PASSWORD_RESET_SEND_SELECTORS, timeout=8)
+    if not selector:
+        raise RuntimeError("OAuth 重置密码页未找到发送验证码按钮")
+    log(f"  OAuth 重置密码验证码已请求: {selector}")
+    transition_started = time.time()
+    deadline = transition_started + 45
+    reloaded_after_send = False
+    while time.time() < deadline:
+        page_type = _password_reset_page_type(page)
+        if page_type in {"reset_password_otp", "reset_password_new_password"}:
+            return True
+        if (
+            _derive_registration_state_from_page(page).get("page_type")
+            == "email_otp_verification"
+        ):
+            # OpenAI currently reuses /email-verification for password-reset
+            # codes.  This is only accepted inside an active reset flow.
+            return True
+        error_text = _extract_auth_error_text(page)
+        if error_text:
+            raise RuntimeError(f"OAuth 重置密码验证码发送失败: {error_text[:300]}")
+        if not reloaded_after_send and time.time() - transition_started >= 12:
+            reloaded_after_send = True
+            log(
+                "  OAuth 重置邮件已发送但表单未刷新，重新加载当前重置会话: "
+                f"{_auth_page_diagnostic(page)}"
+            )
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+            except Exception as exc:
+                log(f"  OAuth 重置页面重新加载未完成: {exc}")
+            continue
+        time.sleep(0.25)
+    raise RuntimeError(
+        "OAuth 重置密码验证码发送后页面未跳转: "
+        f"{_auth_page_diagnostic(page)}"
+    )
+
+
+def _switch_mfa_to_email_otp(page, log, otp_sent_callback=None) -> bool:
+    direct_selector = _find_first_selector(page, MFA_EMAIL_METHOD_SELECTORS)
+    if not direct_selector:
+        other_selector = _click_first(page, MFA_OTHER_METHOD_SELECTORS, timeout=3)
+        if other_selector:
+            log(f"  OAuth MFA 已打开其他验证方式: {other_selector}")
+            time.sleep(0.8)
+        direct_selector = _find_first_selector(page, MFA_EMAIL_METHOD_SELECTORS)
+    if not direct_selector:
+        return False
+    if callable(otp_sent_callback):
+        otp_sent_callback()
+    try:
+        page.locator(direct_selector).first.click(timeout=2500)
+    except Exception:
+        return False
+    log(f"  OAuth MFA 已切换为邮箱验证: {direct_selector}")
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        state = _derive_registration_state_from_page(page)
+        if not _is_mfa_page_type(str(state.get("page_type") or "")):
+            return True
+        time.sleep(0.25)
+    return True
 
 
 def _get_page_oauth_url(page) -> str:
@@ -1456,6 +1686,27 @@ def _pick_best_about_you_input(entries: list[dict], field: str, exclude_visible_
 
 def _derive_registration_state_from_page(page) -> dict:
     current_url = str(page.url or "")
+    reset_page_type = _password_reset_page_type(page)
+    if reset_page_type:
+        return _build_manual_flow_state(reset_page_type, current_url)
+
+    if "/mfa-challenge" in current_url.lower():
+        otp_selector = _find_first_selector(page, OTP_INPUT_SELECTORS)
+        if otp_selector and "password" not in otp_selector.lower():
+            page_text = _get_visible_page_text(page).lower()
+            is_authenticator = bool(
+                re.search(r"authenticator|authentication app|验证器|驗證器", page_text, flags=re.I)
+            )
+            is_email_code = bool(
+                re.search(
+                    r"check your (?:email|inbox)|sent .{0,80}(?:email|inbox|@)|"
+                    r"(?:email|inbox).{0,80}(?:code|verification)|邮箱|郵箱|邮件|郵件",
+                    page_text,
+                    flags=re.I,
+                )
+            )
+            if is_email_code and not is_authenticator:
+                return _build_manual_flow_state("email_otp_verification", current_url)
     state = _extract_flow_state(None, current_url)
     if state.get("page_type"):
         return state
@@ -2254,6 +2505,33 @@ def _is_mfa_page_type(page_type: str) -> bool:
     return any(token in normalized for token in ("mfa", "totp", "authenticator", "two_factor"))
 
 
+def _is_retryable_fresh_oauth_error(error: str) -> bool:
+    text = str(error or "").lower()
+    if any(marker in text for marker in (
+        "429", "rate_limit", "too many requests", "incorrect email address or password",
+        "otp", "验证码", "短信验证", "手机验证", "add_phone", "mfa",
+    )):
+        return False
+    return any(marker in text for marker in (
+        "callback", "consent", "workspace", "session_token", "未完成", "未跳转",
+    ))
+
+
+def _invoke_otp_callback(callback, *, purpose: str = ""):
+    """Invoke newer purpose-aware callbacks without breaking legacy callbacks."""
+    try:
+        signature = inspect.signature(callback)
+        supports_purpose = "purpose" in signature.parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+    except (TypeError, ValueError):
+        supports_purpose = False
+    if supports_purpose:
+        return callback(purpose=purpose)
+    return callback()
+
+
 def _do_codex_oauth(
     page,
     cookies_dict: dict,
@@ -2264,6 +2542,9 @@ def _do_codex_oauth(
     proxy: str | None,
     log,
     mfa_callback=None,
+    reset_password: str = "",
+    otp_sent_callback=None,
+    auth_context: dict | None = None,
 ) -> dict | None:
     """在真实浏览器会话内完成 Codex OAuth，返回完整 token 包。"""
     from .oauth import generate_oauth_url
@@ -2279,6 +2560,10 @@ def _do_codex_oauth(
     except Exception:
         user_agent = _random_chrome_ua()
     device_id = str(cookies_dict.get("oai-did") or uuid.uuid4())
+    auth_context = auth_context if isinstance(auth_context, dict) else {}
+    active_password = str(auth_context.get("effective_password") or password or "")
+    replacement_password = str(reset_password or "").strip()
+    otp_stall_recoveries = 0
     log(f"  OAuth state={oauth_start.state[:20]}...")
 
     try:
@@ -2328,7 +2613,7 @@ def _do_codex_oauth(
                     page,
                     email,
                     log,
-                    allow_passwordless=not bool(password),
+                    allow_passwordless=not bool(active_password),
                 )
                 log(f"  OAuth 邮箱页提交状态: {email_resp.get('status', 0)}")
                 if not email_resp.get("ok"):
@@ -2336,31 +2621,104 @@ def _do_codex_oauth(
                 continue
 
             if state["page_type"] == "login_password":
-                if password:
+                if active_password:
                     log("  OAuth 遇到密码验证，提交登录密码...")
-                    password_resp = _submit_oauth_password_direct(page, password, log)
+                    password_resp = _submit_oauth_password_direct(page, active_password, log)
                     log(f"  OAuth 登录密码提交状态: {password_resp.get('status', 0)}")
                     if not password_resp.get("ok"):
+                        password_error = str(password_resp.get("text") or "")
+                        if (
+                            replacement_password
+                            and otp_callback
+                            and _is_rejected_login_password(password_error)
+                        ):
+                            log("  OAuth 登录密码不正确，切换重置密码流程...")
+                            _start_password_reset(
+                                page,
+                                log,
+                                otp_sent_callback=otp_sent_callback,
+                            )
+                            active_password = ""
+                            continue
                         raise RuntimeError(f"OAuth 登录密码提交失败: {(password_resp.get('text') or '')[:300]}")
                 else:
                     if not otp_callback:
                         raise RuntimeError("OAuth 密码验证页需要一次性验证码，但没有 otp_callback")
                     log("  OAuth 遇到密码验证，强制切换一次性验证码登录...")
+                    if callable(otp_sent_callback):
+                        otp_sent_callback()
                     if not _switch_login_password_to_otp(page, log):
-                        raise RuntimeError("OAuth 密码验证页未找到一次性验证码登录入口")
+                        if not replacement_password:
+                            raise RuntimeError("OAuth 密码验证页未找到一次性验证码登录入口")
+                        _start_password_reset(
+                            page,
+                            log,
+                            otp_sent_callback=otp_sent_callback,
+                        )
                 continue
 
             if _is_mfa_page_type(state["page_type"]):
-                if not mfa_callback:
-                    raise RuntimeError("OAuth 需要 MFA 验证，但账号未配置 MFA 密钥")
-                mfa_code = str(mfa_callback() or "").strip()
-                if not mfa_code:
-                    raise RuntimeError("OAuth MFA 验证码生成失败")
-                log("  OAuth 提交 MFA 验证码...")
-                mfa_resp = _submit_otp_via_page(page, mfa_code, log)
-                log(f"  OAuth MFA 提交状态: {mfa_resp.get('status', 0)}")
-                if not mfa_resp.get("ok"):
-                    raise RuntimeError(f"OAuth MFA 校验失败: {(mfa_resp.get('text') or '')[:300]}")
+                mfa_error = ""
+                if mfa_callback:
+                    mfa_code = str(mfa_callback() or "").strip()
+                    if mfa_code:
+                        log("  OAuth 提交 MFA 验证码...")
+                        mfa_resp = _submit_otp_via_page(page, mfa_code, log)
+                        log(f"  OAuth MFA 提交状态: {mfa_resp.get('status', 0)}")
+                        if mfa_resp.get("ok"):
+                            continue
+                        mfa_error = str(mfa_resp.get("text") or "OAuth MFA 校验失败")
+                    else:
+                        mfa_error = "OAuth MFA 验证码生成失败"
+                if otp_callback and _switch_mfa_to_email_otp(
+                    page,
+                    log,
+                    otp_sent_callback=otp_sent_callback,
+                ):
+                    continue
+                if mfa_error:
+                    raise RuntimeError(
+                        f"OAuth MFA 校验失败且无法切换邮箱验证: {mfa_error[:300]}; "
+                        f"{_auth_page_diagnostic(page)}"
+                    )
+                raise RuntimeError(
+                    "OAuth 需要 MFA 验证，但账号未配置可用 MFA 或邮箱验证方式: "
+                    f"{_auth_page_diagnostic(page)}"
+                )
+
+            if state["page_type"] == "reset_password_start":
+                if not replacement_password or not otp_callback:
+                    raise RuntimeError("OAuth 重置密码缺少新密码或邮箱 otp_callback")
+                _start_password_reset(page, log, otp_sent_callback=otp_sent_callback)
+                continue
+
+            if state["page_type"] == "reset_password_otp":
+                if not otp_callback:
+                    raise RuntimeError("OAuth 重置密码需要邮箱验证码，但没有 otp_callback")
+                log("  OAuth 等待重置密码验证码...")
+                code = str(_invoke_otp_callback(otp_callback, purpose="password_reset") or "").strip()
+                if not code:
+                    raise RuntimeError("OAuth 重置密码验证码获取失败")
+                otp_resp = _submit_otp_via_page(page, code, log)
+                log(f"  OAuth 重置密码验证码提交状态: {otp_resp.get('status', 0)}")
+                if not otp_resp.get("ok"):
+                    raise RuntimeError(f"OAuth 重置密码验证码校验失败: {(otp_resp.get('text') or '')[:300]}")
+                continue
+
+            if state["page_type"] == "reset_password_new_password":
+                if not replacement_password:
+                    raise RuntimeError("OAuth 重置密码页缺少可设置的新密码")
+                reset_resp = _submit_reset_password_via_page(page, replacement_password, log)
+                log(f"  OAuth 新密码提交状态: {reset_resp.get('status', 0)}")
+                if not reset_resp.get("ok"):
+                    raise RuntimeError(f"OAuth 新密码提交失败: {(reset_resp.get('text') or '')[:300]}")
+                active_password = replacement_password
+                auth_context["effective_password"] = active_password
+                if int(reset_resp.get("status") or 0) == 202:
+                    log("  OAuth 新密码已提交但页面未跳转，重新进入授权页验证新密码")
+                else:
+                    log("  OAuth 密码重置成功，重新进入授权页使用新密码登录")
+                page.goto(oauth_start.auth_url, wait_until="domcontentloaded", timeout=30000)
                 continue
 
             if state["page_type"] == "create_account_password":
@@ -2373,17 +2731,25 @@ def _do_codex_oauth(
 
             if state["page_type"] == "email_otp_verification":
                 if not otp_callback:
-                    log("  ⚠️ OAuth 需要邮箱 OTP 但没有 otp_callback")
-                    return None
+                    raise RuntimeError("Codex OAuth 需要邮箱 OTP，但没有可用的 otp_callback")
                 log("  OAuth 等待邮箱验证码...")
-                code = otp_callback()
+                otp_purpose = "mfa" if "/mfa-challenge" in current_url.lower() else "login"
+                code = _invoke_otp_callback(otp_callback, purpose=otp_purpose)
                 if not code:
-                    log("  ⚠️ OAuth OTP 获取失败")
-                    return None
+                    raise RuntimeError("Codex OAuth 邮箱 OTP 获取失败")
                 otp_resp = _submit_otp_via_page(page, code, log)
                 log(f"  OAuth 验证码页提交状态: {otp_resp.get('status', 0)}")
                 if not otp_resp.get("ok"):
-                    raise RuntimeError(f"OAuth 验证码校验失败: {(otp_resp.get('text') or '')[:300]}")
+                    otp_error = str(otp_resp.get("text") or "")
+                    if (
+                        "提交后未跳转" in otp_error
+                        and otp_stall_recoveries < 1
+                        and _recover_stalled_otp_submission(page, oauth_start.auth_url, log)
+                    ):
+                        otp_stall_recoveries += 1
+                        continue
+                    raise RuntimeError(f"OAuth 验证码校验失败: {otp_error[:300]}")
+                otp_stall_recoveries = 0
                 continue
 
             if state["page_type"] == "about_you":
@@ -2402,8 +2768,7 @@ def _do_codex_oauth(
                 session_result = _complete_oauth_with_session(cookies_dict, oauth_start, proxy, log)
                 if session_result:
                     return session_result
-                log("  ⚠️ 页面已到 consent/workspace，但会话补全失败")
-                return None
+                raise RuntimeError("Codex OAuth consent/workspace 未完成 callback")
 
             if state["page_type"] == "add_phone":
                 if phone_callback:
@@ -2416,8 +2781,7 @@ def _do_codex_oauth(
                         )
                         continue
                     except Exception as exc:
-                        log(f"  短信验证失败，停止 OAuth 流程: {exc}")
-                        return None
+                        raise RuntimeError(f"Codex OAuth 短信验证失败: {exc}") from exc
 
                 # 先尝试跳过 add_phone，直接重新访问 OAuth 授权 URL
                 # 用户已登录，重新访问 auth URL 应该能直接跳到 callback
@@ -2471,8 +2835,7 @@ def _do_codex_oauth(
                         return _submit_callback_result(callback_url, oauth_start, proxy)
                     log(f"  跳过 add_phone 异常: {exc}")
 
-                log("  ⚠️ add_phone 无法跳过且无可用接码服务")
-                return None
+                raise RuntimeError("Codex OAuth add_phone 无法跳过且无可用接码服务")
 
             # chatgpt_home: 页面可能正在 JS 重定向（如跳转到 add-phone）
             # 等待更长时间让重定向完成
@@ -2524,8 +2887,7 @@ def _do_codex_oauth(
 
     session_token = cookies_dict.get("__Secure-next-auth.session-token", "")
     if not session_token:
-        log("  ⚠️ 无 session_token，OAuth 失败")
-        return None
+        raise RuntimeError("Codex OAuth 未获取 callback，且无 session_token")
     log("  ⚠️ 完整 OAuth 失败，回退 session access_token")
     return None
 
@@ -2735,6 +3097,24 @@ def _is_retryable_add_phone_error(message: str) -> bool:
     return any(hint.lower() in text for hint in retry_hints)
 
 
+def _resolve_add_phone_attempt_limit(phone_callback, configured_limit: int | None = None) -> int:
+    """Resolve the per-account phone verification attempt limit.
+
+    One attempt is deliberately the default: a rejected number, missing SMS,
+    or invalid code ends the current mailbox task and lets the task runner move
+    to the next mailbox. Operators that want automatic number changes can
+    raise ``register_phone_max_attempts`` in the SMS provider settings.
+    """
+    raw_limit = configured_limit
+    if raw_limit is None:
+        config = getattr(phone_callback, "config", {}) or {}
+        raw_limit = config.get("register_phone_max_attempts", 1)
+    try:
+        return min(10, max(1, int(raw_limit)))
+    except (TypeError, ValueError):
+        return 1
+
+
 def _handle_add_phone_challenge(
     page,
     phone_callback,
@@ -2743,13 +3123,13 @@ def _handle_add_phone_challenge(
     user_agent: str,
     log,
     resume_url: str = "",
-    max_phone_attempts: int = 5,
+    max_phone_attempts: int | None = None,
 ) -> dict:
     """在 add-phone 页面通过 UI 交互完成手机号验证。
 
     流程: 选择国家 -> 输入本地号码 -> 点击发送 -> 填写 OTP -> 点击验证。
-    如果手机号被使用、页面拒绝、验证码错误/超时等，自动换号重试
-    （最多 max_phone_attempts 次）。
+    如果手机号被使用、页面拒绝、验证码错误/超时等，会按接码配置换号重试。
+    默认只尝试一次，失败后由任务调度器继续下一个邮箱。
     """
     if not phone_callback:
         raise RuntimeError(
@@ -2757,10 +3137,11 @@ def _handle_add_phone_challenge(
             "请在 RegisterConfig.extra 中配置接码服务，或手动完成手机验证。"
         )
 
+    attempt_limit = _resolve_add_phone_attempt_limit(phone_callback, max_phone_attempts)
     last_error = None
-    for phone_attempt in range(max_phone_attempts):
+    for phone_attempt in range(attempt_limit):
         if phone_attempt > 0:
-            log(f"换号重试第 {phone_attempt + 1}/{max_phone_attempts} 次...")
+            log(f"换号重试第 {phone_attempt + 1}/{attempt_limit} 次...")
             # 回到 add-phone 页面
             try:
                 page.goto(f"{OPENAI_AUTH}/add-phone", wait_until="domcontentloaded", timeout=15000)
@@ -2779,12 +3160,12 @@ def _handle_add_phone_challenge(
             last_error = exc
             error_msg = str(exc)
             should_retry = _is_retryable_add_phone_error(error_msg)
-            if not should_retry or phone_attempt >= max_phone_attempts - 1:
+            if not should_retry or phone_attempt >= attempt_limit - 1:
                 if should_retry:
-                    log(f"⚠️ 手机验证第 {phone_attempt + 1}/{max_phone_attempts} 次失败，已达到最大换号次数: {error_msg[:180]}")
+                    log(f"⚠️ 手机验证第 {phone_attempt + 1}/{attempt_limit} 次失败，已达到最大换号次数: {error_msg[:180]}")
                     _reset_phone_callback_for_retry(phone_callback, error_msg)
                 raise
-            log(f"⚠️ 手机验证第 {phone_attempt + 1}/{max_phone_attempts} 次失败: {error_msg[:180]}，准备换号重试...")
+            log(f"⚠️ 手机验证第 {phone_attempt + 1}/{attempt_limit} 次失败: {error_msg[:180]}，准备换号重试...")
             _reset_phone_callback_for_retry(phone_callback, error_msg)
 
     raise last_error or RuntimeError("短信验证失败: 多次换号均未收到验证码")
@@ -3559,6 +3940,74 @@ def _submit_oauth_password_direct(page, password: str, log) -> dict:
     return {"ok": False, "status": 0, "url": str(page.url or ""), "data": None, "text": "OAuth 密码提交后未跳转"}
 
 
+def _submit_reset_password_via_page(page, password: str, log) -> dict:
+    password_selector = 'input[type="password"]:visible'
+    password_inputs = page.locator(password_selector)
+    try:
+        count = password_inputs.count()
+    except Exception:
+        count = 0
+    if count <= 0:
+        return {"ok": False, "status": 0, "url": page.url, "data": None, "text": "重置密码页未找到新密码输入框"}
+    for index in range(count):
+        last_error = ""
+        filled = False
+        for _attempt in range(2):
+            # Filling the first field can re-render the React form, so resolve
+            # every field again instead of retaining a potentially stale node.
+            target = page.locator(password_selector).nth(index)
+            try:
+                target.wait_for(state="visible", timeout=2500)
+                # A browser password-suggestion popup can cover the confirm
+                # field after the first fill. Locator.fill does not need the
+                # preliminary pointer click and avoids that overlay entirely.
+                target.fill(password, timeout=5000)
+                if str(target.input_value(timeout=1500) or "") == password:
+                    filled = True
+                    break
+                last_error = "填写后回验不一致"
+            except Exception as exc:
+                last_error = str(exc).strip() or exc.__class__.__name__
+                time.sleep(0.3)
+        if not filled:
+            return {
+                "ok": False,
+                "status": 0,
+                "url": page.url,
+                "data": None,
+                "text": (
+                    f"重置密码页第 {index + 1} 个输入框填写失败: {last_error[:240]}; "
+                    f"{_auth_page_diagnostic(page)}"
+                ),
+            }
+    log(f"  OAuth 重置密码页已填写 {count} 个密码输入框")
+    submit_selector = _click_first(page, PASSWORD_SUBMIT_SELECTORS, timeout=8)
+    if not submit_selector:
+        return {"ok": False, "status": 0, "url": page.url, "data": None, "text": "重置密码页未找到 Continue 按钮"}
+    log(f"  OAuth 重置密码页已点击继续按钮: {submit_selector}")
+
+    deadline = time.time() + 25
+    while time.time() < deadline:
+        state = _derive_registration_state_from_page(page)
+        page_type = str(state.get("page_type") or "")
+        if page_type not in {"reset_password_start", "reset_password_otp", "reset_password_new_password"}:
+            return {"ok": True, "status": 200, "url": page.url, "data": None, "text": ""}
+        error_text = _extract_auth_error_text(page)
+        if error_text:
+            return {"ok": False, "status": 400, "url": page.url, "data": None, "text": error_text}
+        time.sleep(0.4)
+    # OpenAI can persist the new password while its SPA remains on this page.
+    # The caller must verify it by restarting OAuth with the replacement
+    # password; callback/token success remains the final success criterion.
+    return {
+        "ok": True,
+        "status": 202,
+        "url": page.url,
+        "data": None,
+        "text": "新密码已提交，页面未跳转，等待重新登录验证",
+    }
+
+
 def _submit_password_via_page(page, password: str, log) -> dict:
     if _recover_signup_password_page(page, log):
         time.sleep(1)
@@ -3619,6 +4068,7 @@ def _submit_password_via_page(page, password: str, log) -> dict:
 
 
 def _submit_otp_via_page(page, code: str, log) -> dict:
+    submission_url = str(page.url or "")
     otp = str(code or "").strip()
     if not otp:
         return {"ok": False, "status": 400, "url": page.url, "data": None, "text": "验证码为空"}
@@ -3731,7 +4181,21 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
     while time.time() < deadline:
         current_url = page.url
         last_url = current_url or last_url
-        if _is_reset_new_password_url(current_url):
+        page_type = str(_derive_registration_state_from_page(page).get("page_type") or "")
+        # A successful login OTP can advance from /email-verification to an
+        # MFA email challenge whose DOM is still classified as another OTP
+        # form.  Treat that route transition as progress so the OAuth state
+        # machine can select the MFA email branch instead of retrying the
+        # already-consumed login code.
+        if (
+            "/mfa-challenge" in str(current_url or "").lower()
+            and str(current_url or "") != submission_url
+        ) or page_type == "mfa_challenge":
+            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+        if (
+            page_type in {"reset_password_new_password", "login_password"}
+            or _is_reset_new_password_url(current_url)
+        ):
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         if "about-you" in current_url:
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
@@ -3747,6 +4211,17 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
             return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
         time.sleep(0.5)
     return {"ok": False, "status": 0, "url": last_url, "data": None, "text": "验证码页提交后未跳转"}
+
+
+def _recover_stalled_otp_submission(page, oauth_url: str, log) -> bool:
+    """Re-enter OAuth once when an OTP submit neither advances nor errors."""
+    log("  OAuth 验证码提交无跳转，重新进入授权页确认验证状态...")
+    try:
+        page.goto(oauth_url, wait_until="domcontentloaded", timeout=30000)
+        return True
+    except Exception as exc:
+        log(f"  OAuth 验证码无跳转恢复失败: {exc}")
+        return False
 
 
 def _submit_about_you_via_page(page, log) -> dict:
@@ -4592,6 +5067,8 @@ class ChatGPTBrowserRegister:
         otp_callback: Optional[Callable[[], str]] = None,
         mfa_callback: Optional[Callable[[], str]] = None,
         phone_callback: Optional[Callable[[], str]] = None,
+        reset_password: str = "",
+        otp_sent_callback: Optional[Callable[[], None]] = None,
         log_fn: Callable[[str], None] = print,
         login_password: str = "",
     ):
@@ -4600,6 +5077,9 @@ class ChatGPTBrowserRegister:
         self.otp_callback = otp_callback
         self.mfa_callback = mfa_callback
         self.phone_callback = phone_callback
+        self.reset_password = str(reset_password or "")
+        self.otp_sent_callback = otp_sent_callback
+        self.effective_password = ""
         self.log = log_fn
         self.login_password = str(login_password or "")
         self.last_oauth_error = ""
@@ -4607,33 +5087,37 @@ class ChatGPTBrowserRegister:
     def run(self, email: str, password: str) -> dict:
         proxy = _build_proxy_config(self.proxy)
         launch_opts = _camoufox_launch_options(headless=self.headless, proxy=proxy)
+        if not self.reset_password:
+            self.reset_password = str(password or "")
 
-        with Camoufox(**launch_opts) as browser:
-            page = browser.new_page()
-            self.log("启动浏览器上下文注册状态机")
-            final_state = _browser_registration_flow(
-                page,
-                email,
-                password,
-                self.otp_callback,
-                self.phone_callback,
-                self.log,
-                login_password=self.login_password,
-            )
-            self.log(f"注册流程完成: page={final_state.get('page_type') or '-'}")
-            account_password = str(final_state.get("account_password") or "")
+        with _codex_browser_slot(self.log):
+            with Camoufox(**launch_opts) as browser:
+                page = browser.new_page()
+                self.log("启动浏览器上下文注册状态机")
+                final_state = _browser_registration_flow(
+                    page,
+                    email,
+                    password,
+                    self.otp_callback,
+                    self.phone_callback,
+                    self.log,
+                    login_password=self.login_password,
+                )
+                self.log(f"注册流程完成: page={final_state.get('page_type') or '-'}")
+                account_password = str(final_state.get("account_password") or "")
 
-            # 获取 session token 和 cookies
-            cookies_dict = _get_cookies(page)
+                # 获取 session token 和 cookies
+                cookies_dict = _get_cookies(page)
 
-            # ═══ 通过 Codex CLI OAuth 获取正确的 token ═══
-            # 注册完成后的浏览器上下文 session 状态不稳定（NS_BINDING_ABORTED），
-            # 直接用全新浏览器做 OAuth 更可靠
-            self.log("执行 Codex CLI OAuth 流程获取 token...")
+                # ═══ 通过 Codex CLI OAuth 获取正确的 token ═══
+                # 注册完成后的浏览器上下文 session 状态不稳定（NS_BINDING_ABORTED），
+                # 直接用全新浏览器做 OAuth 更可靠
+                self.log("执行 Codex CLI OAuth 流程获取 token...")
 
         # 直接用全新浏览器做 OAuth（注册后的浏览器上下文不可靠）
         codex_result = self._retry_oauth_fresh_browser(email, account_password)
         if codex_result:
+            account_password = str(self.effective_password or account_password)
             self.log(f"全新浏览器 OAuth 成功: account_id={codex_result.get('account_id','')}")
             return {
                 "email": email, "password": account_password,
@@ -4648,21 +5132,47 @@ class ChatGPTBrowserRegister:
         raise RuntimeError("ChatGPT 注册未完成完整 OAuth callback，已拒绝回退到 session/access_token 半成品结果")
 
     def _retry_oauth_fresh_browser(self, email, password):
-        """在全新浏览器 context 里做 Codex OAuth（绕过 add_phone session）。"""
+        """Run Codex OAuth in a fresh context, retrying callback-only failures once."""
         self.last_oauth_error = ""
         proxy = _build_proxy_config(self.proxy)
         launch_opts = _camoufox_launch_options(headless=self.headless, proxy=proxy)
         try:
-            with Camoufox(**launch_opts) as browser:
-                page = browser.new_page()
-                self.log("  全新浏览器 OAuth 开始...")
-                result = _do_codex_oauth(
-                    page, {}, email, password,
-                    self.otp_callback, self.phone_callback, self.proxy, self.log,
-                    mfa_callback=self.mfa_callback,
+            from core.config_store import config_store
+
+            attempt_limit = min(2, max(1, int(config_store.get("chatgpt_codex_oauth_attempts", "2") or 2)))
+        except Exception:
+            attempt_limit = 2
+
+        for attempt in range(attempt_limit):
+            auth_context = {
+                "effective_password": self.effective_password or str(password or ""),
+            }
+            try:
+                with _codex_browser_slot(self.log):
+                    with Camoufox(**launch_opts) as browser:
+                        page = browser.new_page()
+                        self.log(f"  全新浏览器 OAuth 开始 ({attempt + 1}/{attempt_limit})...")
+                        result = _do_codex_oauth(
+                            page, {}, email, password,
+                            self.otp_callback, self.phone_callback, self.proxy, self.log,
+                            mfa_callback=self.mfa_callback,
+                            reset_password=self.reset_password,
+                            otp_sent_callback=self.otp_sent_callback,
+                            auth_context=auth_context,
+                        )
+                        if result:
+                            return result
+                        self.last_oauth_error = "Codex OAuth 浏览器流程未完成 callback"
+            except Exception as exc:
+                self.last_oauth_error = str(exc).strip() or exc.__class__.__name__
+                self.log(f"  全新浏览器 OAuth 异常: {self.last_oauth_error}")
+            finally:
+                self.effective_password = str(
+                    auth_context.get("effective_password") or self.effective_password or ""
                 )
-                return result
-        except Exception as e:
-            self.last_oauth_error = str(e).strip() or e.__class__.__name__
-            self.log(f"  全新浏览器 OAuth 异常: {e}")
-            return None
+
+            if attempt >= attempt_limit - 1 or not _is_retryable_fresh_oauth_error(self.last_oauth_error):
+                break
+            self.log("  callback/consent 未完成，2 秒后使用新的浏览器上下文重试一次...")
+            time.sleep(2)
+        return None

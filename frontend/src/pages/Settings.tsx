@@ -275,6 +275,15 @@ const TABS: { id: string; label: string; icon: any; sections?: any[] }[] = [
   {
     id: 'chatgpt', label: 'ChatGPT', icon: Shield,
     sections: [{
+      section: '注册稳定性',
+      desc: '配置批量注册并发、账号启动间隔和可选的限流冷却。',
+      items: [
+        { key: 'chatgpt_register_max_concurrency', label: '最大注册并发', placeholder: '5' },
+        { key: 'chatgpt_register_interval_seconds', label: '账号间隔（秒）', placeholder: '0' },
+        { key: 'chatgpt_rate_limit_cooldown_seconds', label: '429 冷却（秒，0 为关闭）', placeholder: '0' },
+        { key: 'chatgpt_codex_oauth_attempts', label: 'Callback 尝试次数', placeholder: '2' },
+      ],
+    }, {
       section: 'CPA 面板',
       desc: '注册完成后自动上传到 CPA 管理平台',
       items: [

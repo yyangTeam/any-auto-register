@@ -6,6 +6,7 @@ import threading
 import time
 from core.base_sms import (
     HeroSmsProvider,
+    LongNotesSmsProvider,
     SmsActivation,
     SmsActivateProvider,
     create_sms_provider,
@@ -76,6 +77,64 @@ class TestCreateSmsProvider:
     def test_unknown_provider(self):
         with pytest.raises(RuntimeError, match="未知"):
             create_sms_provider("unknown", {})
+
+    def test_longnotes_link(self):
+        provider = create_sms_provider(
+            "longnotes_link",
+            {"longnotes_url": "https://longnotes.cn/m/share_token"},
+        )
+        assert isinstance(provider, LongNotesSmsProvider)
+
+
+def test_longnotes_provider_gets_number_and_sms_code(monkeypatch):
+    class Response:
+        status_code = 200
+        text = ""
+
+        def __init__(self, payload=None):
+            self.payload = payload or {}
+
+        def json(self):
+            return self.payload
+
+    states = iter([
+        Response({"data": {"orderState": "CANCELED", "phoneNumber": None, "smsMessages": []}}),
+        Response({"data": {"orderState": "NUMBER_WAITING", "phoneNumber": None, "smsMessages": []}}),
+        Response({"data": {"orderState": "PHONE_ACTIVE", "phoneNumber": "573001112233", "smsMessages": []}}),
+        Response({"data": {"orderState": "SMS_RECEIVED", "phoneNumber": "573001112233", "smsMessages": [{"smsCode": "482913"}]}}),
+        Response({"data": {"orderState": "CANCELED", "phoneNumber": None, "smsMessages": []}}),
+    ])
+    events = []
+
+    class Session:
+        proxies = {}
+
+        def get(self, url, **kwargs):
+            events.append(("get", url))
+            return Response()
+
+        def post(self, url, **kwargs):
+            events.append(("post", url.rsplit("/", 1)[-1]))
+            return next(states)
+
+    provider = LongNotesSmsProvider("https://longnotes.cn/m/share_token", poll_interval=0.5)
+    provider.session = Session()
+    monkeypatch.setattr("core.base_sms.time.sleep", lambda seconds: None)
+
+    activation = provider.get_number(service="chatgpt")
+    code = provider.get_code(activation.activation_id, timeout=10)
+
+    assert activation.phone_number == "+573001112233"
+    assert code == "482913"
+    assert provider.cancel(activation.activation_id) is True
+    assert events == [
+        ("get", "https://longnotes.cn/m/share_token"),
+        ("post", "state"),
+        ("post", "number"),
+        ("post", "state"),
+        ("post", "state"),
+        ("post", "cancel"),
+    ]
 
 
 class TestCreatePhoneCallbacks:

@@ -83,6 +83,30 @@ def build_phone_callbacks(ctx: RegistrationContext, *, service: str | None = Non
     from infrastructure.provider_settings_repository import ProviderSettingsRepository
 
     extra = ctx.extra
+    mailbox_account = getattr(ctx.identity, "mailbox_account", None)
+    mailbox_extra = dict(getattr(mailbox_account, "extra", {}) or {})
+    provider_account = dict(mailbox_extra.get("provider_account") or {})
+    mailbox_credentials = dict(provider_account.get("credentials") or {})
+    auxiliary_phone_url = str(mailbox_credentials.get("auxiliary_phone_url") or "").strip()
+    if auxiliary_phone_url:
+        per_account_config = {
+            "longnotes_url": auxiliary_phone_url,
+            "sms_code_timeout": extra.get("sms_code_timeout", 120),
+            "sms_no_reuse_max_attempts": extra.get("sms_no_reuse_max_attempts", 1),
+            "longnotes_poll_interval": extra.get("longnotes_poll_interval", 3),
+        }
+        if ctx.proxy:
+            per_account_config["sms_proxy"] = ctx.proxy
+        ctx.log("[SMS] 使用邮箱记录自带的 LongNotes Codex 辅助接码链接")
+        return create_phone_callbacks(
+            "longnotes_link",
+            per_account_config,
+            service=str(service or ctx.platform_name),
+            country="",
+            log_fn=ctx.log,
+            cancel_check=extra.get("_cancel_check") if callable(extra.get("_cancel_check")) else None,
+        )
+
     requested_provider_key = str(
         extra.get("sms_provider")
         or extra.get("phone_provider")
