@@ -357,6 +357,7 @@ class RegistrationEngine:
         self._codex_otp_continue_url: str = ""
         self._has_supplied_login_password = False
         self.force_email_otp_login = False
+        self.mailbox_receive_ready = True
         # chatgpt.com NextAuth is occasionally challenged at the network edge
         # while auth.openai.com remains usable.  Keep this explicit so the
         # later session lookup can follow the same transport branch.
@@ -1823,6 +1824,7 @@ class RegistrationEngine:
                 self._log("Codex login 已请求新的邮箱验证码")
 
             cached_mfa_otp = ""
+            last_mfa_code = ""
 
             def wait_for_browser_otp(*, purpose: str = "") -> Optional[str]:
                 nonlocal cached_mfa_otp
@@ -1842,16 +1844,36 @@ class RegistrationEngine:
                 return code
 
             def current_mfa_code() -> Optional[str]:
+                nonlocal last_mfa_code
                 secret = str(getattr(self, "totp_secret", "") or "").strip()
                 totp_url = str(getattr(self, "totp_url", "") or "").strip()
-                if totp_url:
+                if not secret:
+                    if not totp_url:
+                        return None
+                if secret:
+                    remaining = 30 - (time.time() % 30)
+                    if remaining < 8:
+                        self._log(f"Codex login 当前 MFA 周期仅剩 {remaining:.1f} 秒，等待下一周期")
+                        time.sleep(remaining + 0.5)
+                    code = generate_totp(secret)
+                    self._log("Codex login 已生成当前 MFA 验证码")
+                else:
                     code = fetch_totp_code(totp_url, proxy_url=self.proxy_url)
                     self._log("Codex login 已从 MFA 地址获取当前验证码")
-                    return code
-                if not secret:
-                    return None
-                code = generate_totp(secret)
-                self._log("Codex login 已生成当前 MFA 验证码")
+
+                # A retry must use a different TOTP. The first page submit can
+                # consume most of a 30-second period before reporting failure.
+                deadline = time.time() + 35
+                while last_mfa_code and code == last_mfa_code and time.time() < deadline:
+                    remaining = 30 - (time.time() % 30)
+                    self._log(f"Codex login 等待下一周期 MFA 验证码（约 {remaining:.1f} 秒）")
+                    time.sleep(min(remaining + 0.5, 31))
+                    code = (
+                        generate_totp(secret)
+                        if secret
+                        else fetch_totp_code(totp_url, proxy_url=self.proxy_url)
+                    )
+                last_mfa_code = code
                 return code
 
             has_mfa = bool(
@@ -1861,7 +1883,11 @@ class RegistrationEngine:
             browser_flow = ChatGPTBrowserRegister(
                 headless=True,
                 proxy=self.proxy_url,
-                otp_callback=wait_for_browser_otp,
+                otp_callback=(
+                    wait_for_browser_otp
+                    if getattr(self, "mailbox_receive_ready", True)
+                    else None
+                ),
                 mfa_callback=current_mfa_code if has_mfa else None,
                 phone_callback=self.phone_callback,
                 reset_password=(

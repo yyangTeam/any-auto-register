@@ -1088,6 +1088,72 @@ def test_browser_login_otp_treats_mfa_route_transition_as_success(monkeypatch):
     assert result["url"].endswith("/mfa-challenge")
 
 
+def test_browser_mfa_otp_requires_page_transition(monkeypatch):
+    class Target:
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            return 1
+
+        def wait_for(self, **kwargs):
+            return None
+
+        def click(self, **kwargs):
+            return None
+
+        def fill(self, value):
+            return None
+
+        def type(self, value, **kwargs):
+            return None
+
+        def input_value(self):
+            return "123456"
+
+        def text_content(self, **kwargs):
+            return "Invalid code"
+
+    class Page:
+        url = "https://auth.openai.com/mfa-challenge/challenge-id"
+
+        def wait_for_load_state(self, *args, **kwargs):
+            return None
+
+        def locator(self, selector):
+            return Target()
+
+        def get_by_label(self, pattern):
+            return Target()
+
+        def get_by_role(self, role, name=None):
+            return Target()
+
+    monkeypatch.setattr(browser_register_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(browser_register_module, "_browser_pause", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        browser_register_module,
+        "_click_first",
+        lambda *args, **kwargs: 'button[type="submit"]',
+    )
+    monkeypatch.setattr(
+        browser_register_module,
+        "_derive_registration_state_from_page",
+        lambda current_page: {"page_type": "mfa_challenge"},
+    )
+
+    result = browser_register_module._submit_otp_via_page(
+        Page(),
+        "123456",
+        lambda message: None,
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == 400
+    assert result["text"] == "Invalid code"
+
+
 def test_protocol_otp_send_rejects_redirect_false_positive():
     engine = object.__new__(RegistrationEngine)
     engine._otp_sent_at = None
@@ -1287,6 +1353,192 @@ def test_mfa_browser_login_keeps_email_otp_fallback_without_using_it(monkeypatch
     token_info = engine._complete_codex_login_password_in_browser()
 
     assert token_info == {"access_token": "at", "refresh_token": "rt"}
+
+
+def test_mfa_browser_login_without_mailbox_disables_email_fallback(monkeypatch):
+    engine = object.__new__(RegistrationEngine)
+    engine.email = "user@example.com"
+    engine.password = "Secret123!"
+    engine.totp_secret = "JBSWY3DPEHPK3PXP"
+    engine.totp_url = ""
+    engine.proxy_url = None
+    engine.phone_callback = None
+    engine.mailbox_receive_ready = False
+    engine._last_codex_error = ""
+    engine._log = lambda message, level="info": None
+    engine._get_verification_code = lambda: pytest.fail("mailbox OTP fallback must be disabled")
+
+    def retry(self, email, password):
+        assert self.otp_callback is None
+        assert callable(self.mfa_callback)
+        return {"access_token": "at", "refresh_token": "rt"}
+
+    monkeypatch.setattr(browser_register_module.ChatGPTBrowserRegister, "_retry_oauth_fresh_browser", retry)
+
+    assert engine._complete_codex_login_password_in_browser() == {
+        "access_token": "at",
+        "refresh_token": "rt",
+    }
+
+
+def test_mfa_callback_avoids_expiring_code_and_uses_next_period_on_retry(monkeypatch):
+    engine = object.__new__(RegistrationEngine)
+    engine.email = "user@example.com"
+    engine.password = "Secret123!"
+    engine.totp_secret = "JBSWY3DPEHPK3PXP"
+    engine.totp_url = ""
+    engine.proxy_url = None
+    engine.phone_callback = None
+    engine.mailbox_receive_ready = False
+    engine._is_existing_account = True
+    engine._has_supplied_login_password = True
+    engine._last_codex_error = ""
+    engine._log = lambda message, level="info": None
+
+    now = [55.0]
+    sleeps = []
+
+    monkeypatch.setattr("platforms.chatgpt.register.time.time", lambda: now[0])
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    monkeypatch.setattr("platforms.chatgpt.register.time.sleep", fake_sleep)
+
+    def retry(self, email, password):
+        first = self.mfa_callback()
+        second = self.mfa_callback()
+        assert first != second
+        return {"access_token": "at", "refresh_token": "rt"}
+
+    monkeypatch.setattr(browser_register_module.ChatGPTBrowserRegister, "_retry_oauth_fresh_browser", retry)
+
+    assert engine._complete_codex_login_password_in_browser() == {
+        "access_token": "at",
+        "refresh_token": "rt",
+    }
+    assert sleeps[0] >= 5
+    assert sleeps[1] >= 29
+
+
+def test_codex_oauth_retries_mfa_before_email_fallback(monkeypatch):
+    oauth_start = SimpleNamespace(
+        auth_url="https://auth.openai.com/mfa-challenge",
+        state="state_123",
+        code_verifier="verifier_123",
+        redirect_uri="http://localhost:1455/auth/callback",
+        client_id="client_123",
+    )
+
+    class FakePage:
+        url = "about:blank"
+
+        def goto(self, url, **kwargs):
+            self.url = url
+
+        def evaluate(self, script):
+            return "Test User Agent"
+
+    page = FakePage()
+    codes = iter(["111111", "222222"])
+    submitted = []
+
+    monkeypatch.setattr("platforms.chatgpt.oauth.generate_oauth_url", lambda **kwargs: oauth_start)
+    monkeypatch.setattr(browser_register_module, "_get_page_oauth_url", lambda page: "")
+    monkeypatch.setattr(
+        browser_register_module,
+        "_derive_oauth_state_from_page",
+        lambda page: {"page_type": "mfa_challenge", "continue_url": ""},
+    )
+
+    def submit_mfa(page, code, log):
+        submitted.append(code)
+        if len(submitted) == 1:
+            return {"ok": False, "status": 400, "text": "Invalid code"}
+        page.url = "http://localhost:1455/auth/callback?code=done&state=state_123"
+        return {"ok": True, "status": 200, "text": ""}
+
+    monkeypatch.setattr(browser_register_module, "_submit_otp_via_page", submit_mfa)
+    monkeypatch.setattr(
+        browser_register_module,
+        "_switch_mfa_to_email_otp",
+        lambda *args, **kwargs: pytest.fail("valid second MFA must not use email fallback"),
+    )
+    monkeypatch.setattr(
+        browser_register_module,
+        "_submit_callback_result",
+        lambda callback_url, oauth_start, proxy: {"callback_url": callback_url},
+    )
+
+    result = browser_register_module._do_codex_oauth(
+        page,
+        {},
+        "user@example.com",
+        "Secret123!",
+        lambda: "email-code-must-not-be-used",
+        None,
+        None,
+        lambda message: None,
+        mfa_callback=lambda: next(codes),
+    )
+
+    assert submitted == ["111111", "222222"]
+    assert result["callback_url"].endswith("code=done&state=state_123")
+
+
+def test_codex_oauth_mfa_without_mailbox_reports_direct_failure(monkeypatch):
+    oauth_start = SimpleNamespace(
+        auth_url="https://auth.openai.com/mfa-challenge",
+        state="state_123",
+        code_verifier="verifier_123",
+        redirect_uri="http://localhost:1455/auth/callback",
+        client_id="client_123",
+    )
+
+    class FakePage:
+        url = "about:blank"
+
+        def goto(self, url, **kwargs):
+            self.url = url
+
+        def evaluate(self, script):
+            return "Test User Agent"
+
+    page = FakePage()
+    codes = iter(["111111", "222222"])
+
+    monkeypatch.setattr("platforms.chatgpt.oauth.generate_oauth_url", lambda **kwargs: oauth_start)
+    monkeypatch.setattr(browser_register_module, "_get_page_oauth_url", lambda page: "")
+    monkeypatch.setattr(
+        browser_register_module,
+        "_derive_oauth_state_from_page",
+        lambda page: {"page_type": "mfa_challenge", "continue_url": ""},
+    )
+    monkeypatch.setattr(
+        browser_register_module,
+        "_submit_otp_via_page",
+        lambda page, code, log: {"ok": False, "status": 400, "text": "Invalid code"},
+    )
+    monkeypatch.setattr(
+        browser_register_module,
+        "_switch_mfa_to_email_otp",
+        lambda *args, **kwargs: pytest.fail("no mailbox must not try email fallback"),
+    )
+    monkeypatch.setattr(browser_register_module, "_auth_page_diagnostic", lambda page: "page=mfa")
+
+    with pytest.raises(RuntimeError, match="没有可用邮箱收件配置"):
+        browser_register_module._do_codex_oauth(
+            page,
+            {},
+            "user@example.com",
+            "Secret123!",
+            None,
+            None,
+            None,
+            lambda message: None,
+            mfa_callback=lambda: next(codes),
+        )
 
 
 @pytest.mark.parametrize("initial_password", ["", "WrongPassword123!"])
@@ -1644,6 +1896,7 @@ def test_protocol_mailbox_worker_passes_password_and_mfa_credentials():
     captured = {}
 
     def login_existing(**kwargs):
+        assert worker.engine.mailbox_receive_ready is False
         captured.update(kwargs)
         return SimpleNamespace(success=True)
 

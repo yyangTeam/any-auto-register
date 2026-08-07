@@ -2659,17 +2659,27 @@ def _do_codex_oauth(
 
             if _is_mfa_page_type(state["page_type"]):
                 mfa_error = ""
+                mfa_completed = False
                 if mfa_callback:
-                    mfa_code = str(mfa_callback() or "").strip()
-                    if mfa_code:
-                        log("  OAuth 提交 MFA 验证码...")
+                    for mfa_attempt in range(2):
+                        mfa_code = str(mfa_callback() or "").strip()
+                        if not mfa_code:
+                            mfa_error = "OAuth MFA 验证码生成失败"
+                            break
+                        log(f"  OAuth 提交 MFA 验证码 ({mfa_attempt + 1}/2)...")
                         mfa_resp = _submit_otp_via_page(page, mfa_code, log)
                         log(f"  OAuth MFA 提交状态: {mfa_resp.get('status', 0)}")
                         if mfa_resp.get("ok"):
-                            continue
+                            mfa_completed = True
+                            break
                         mfa_error = str(mfa_resp.get("text") or "OAuth MFA 校验失败")
-                    else:
-                        mfa_error = "OAuth MFA 验证码生成失败"
+                        current_state = _derive_oauth_state_from_page(page)
+                        if not _is_mfa_page_type(str(current_state.get("page_type") or "")):
+                            break
+                        if mfa_attempt == 0:
+                            log("  OAuth MFA 首次校验未通过，使用下一周期动态码重试一次...")
+                if mfa_completed:
+                    continue
                 if otp_callback and _switch_mfa_to_email_otp(
                     page,
                     log,
@@ -2677,8 +2687,14 @@ def _do_codex_oauth(
                 ):
                     continue
                 if mfa_error:
+                    fallback_detail = (
+                        "邮箱验证切换失败"
+                        if otp_callback
+                        else "账号没有可用邮箱收件配置，未回退邮箱验证"
+                    )
                     raise RuntimeError(
-                        f"OAuth MFA 校验失败且无法切换邮箱验证: {mfa_error[:300]}; "
+                        f"OAuth MFA 校验失败（已尝试两个动态码），{fallback_detail}: "
+                        f"{mfa_error[:300]}; "
                         f"{_auth_page_diagnostic(page)}"
                     )
                 raise RuntimeError(
@@ -4073,6 +4089,14 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
     if not otp:
         return {"ok": False, "status": 400, "url": page.url, "data": None, "text": "验证码为空"}
 
+    submission_page_type = str(
+        _derive_registration_state_from_page(page).get("page_type") or ""
+    )
+    submission_was_mfa = (
+        _is_mfa_page_type(submission_page_type)
+        or "/mfa-challenge" in submission_url.lower()
+    )
+
     # 等待页面加载完成，确保 OTP 输入框已渲染
     try:
         page.wait_for_load_state("domcontentloaded", timeout=5000)
@@ -4187,10 +4211,14 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
         # form.  Treat that route transition as progress so the OAuth state
         # machine can select the MFA email branch instead of retrying the
         # already-consumed login code.
-        if (
-            "/mfa-challenge" in str(current_url or "").lower()
-            and str(current_url or "") != submission_url
-        ) or page_type == "mfa_challenge":
+        entered_mfa = not submission_was_mfa and (
+            (
+                "/mfa-challenge" in str(current_url or "").lower()
+                and str(current_url or "") != submission_url
+            )
+            or _is_mfa_page_type(page_type)
+        )
+        if entered_mfa:
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         if (
             page_type in {"reset_password_new_password", "login_password"}

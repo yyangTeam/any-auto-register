@@ -109,6 +109,17 @@ class ChatGPTProtocolMailboxWorker:
         credential_password = str(credentials.get("password") or "")
         credential_totp_secret = str(credentials.get("totp_secret") or "")
         credential_totp_url = str(credentials.get("totp_url") or "")
+        self.engine.mailbox_receive_ready = bool(
+            str(credentials.get("icloud_api_url") or "").strip()
+            or (
+                str(credentials.get("client_id") or "").strip()
+                and str(credentials.get("refresh_token") or "").strip()
+            )
+            or (
+                str(credentials.get("imap_host") or "").strip()
+                and str(credentials.get("password") or "").strip()
+            )
+        )
         self.engine.password = credential_password or password
         self.engine.totp_secret = credential_totp_secret
         self.engine.totp_url = credential_totp_url
